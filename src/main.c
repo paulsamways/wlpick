@@ -35,8 +35,8 @@
  * Tunables
  * ---------------------------------------------------------------------- */
 
-#define PREVIEW_SIZE 100   /* side length of the color preview square, px */
-#define CURSOR_SIZE  10    /* side length of the hollow-square cursor, px  */
+#define PREVIEW_SIZE 110   /* side length of the color preview square, px */
+#define CURSOR_SIZE  11    /* side length of the hollow-square cursor, px  */
 #define CURSOR_HOT   5     /* hotspot offset from top-left corner          */
 #define MAX_OUTPUTS  8     /* maximum number of simultaneously tracked outputs */
 #define BTN_RIGHT_EVDEV 273U  /* evdev right mouse button code             */
@@ -282,8 +282,9 @@ static void draw_label(Output *out, uint32_t *pixels,
     uint32_t oh  = out->ov_height;
     /* 7 glyphs × 10px + 6 gaps × 2px = 82px total label width.          */
     int32_t x0 = sq_x + (int32_t)((PREVIEW_SIZE - 82) / 2);
-    /* 7 rows × 2px = 14px glyph height, 4px bottom margin.             */
-    int32_t y0 = sq_y + (int32_t)(PREVIEW_SIZE - 18);
+    /* 7 rows × 2px = 14px glyph height; centre vertically in the 20px bar.
+     * bar top = PREVIEW_SIZE-20; (20-14)/2 = 3px padding → PREVIEW_SIZE-17. */
+    int32_t y0 = sq_y + (int32_t)(PREVIEW_SIZE - 17);
 
     if (y0 < 0) {
         return;
@@ -313,6 +314,61 @@ static void draw_label(Output *out, uint32_t *pixels,
                 pixels[base + 1U]              = text_color;
                 pixels[base + (size_t)ow]      = text_color;
                 pixels[base + (size_t)ow + 1U] = text_color;
+            }
+        }
+    }
+}
+
+/* Fill a solid rectangle of height `bar_h` at the bottom of the preview
+ * square.  Used as the background behind the hex label.              */
+static void draw_color_bar(Output *out, uint32_t *pixels,
+                           int32_t sq_x, int32_t sq_y,
+                           int32_t bar_h, uint32_t color)
+{
+    uint32_t ow = out->ov_width;
+    uint32_t oh = out->ov_height;
+    int32_t  y0 = sq_y + (int32_t)PREVIEW_SIZE - bar_h;
+    for (int32_t dy = 0; dy < bar_h; dy++) {
+        int32_t row = y0 + dy;
+        if (row < 0 || row >= (int32_t)oh) {
+            continue;
+        }
+        for (int32_t dx = 0; dx < PREVIEW_SIZE; dx++) {
+            int32_t col = sq_x + dx;
+            if (col >= 0 && col < (int32_t)ow) {
+                pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
+            }
+        }
+    }
+}
+
+/* Draw a 1-pixel border around the zoomed block that corresponds to the
+ * sampled (hotspot) pixel.  Block size = zoom × zoom; its top-left corner
+ * in the preview is at (CURSOR_HOT × zoom, CURSOR_HOT × zoom).           */
+static void draw_sample_marker(Output *out, uint32_t *pixels,
+                               int32_t sq_x, int32_t sq_y, uint32_t color)
+{
+    uint32_t ow   = out->ov_width;
+    uint32_t oh   = out->ov_height;
+    int32_t  zoom = PREVIEW_SIZE / CURSOR_SIZE;
+    int32_t  bx0  = sq_x + (CURSOR_HOT * zoom);
+    int32_t  by0  = sq_y + (CURSOR_HOT * zoom);
+
+    for (int32_t di = -1; di <= zoom; di++) {
+        /* Top and bottom edges. */
+        for (int32_t edge = -1; edge <= zoom; edge += (zoom + 1)) {
+            int32_t row = by0 + edge;
+            int32_t col = bx0 + di;
+            if (row >= 0 && row < (int32_t)oh && col >= 0 && col < (int32_t)ow) {
+                pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
+            }
+        }
+        /* Left and right edges. */
+        for (int32_t edge = -1; edge <= zoom; edge += (zoom + 1)) {
+            int32_t row = by0 + di;
+            int32_t col = bx0 + edge;
+            if (row >= 0 && row < (int32_t)oh && col >= 0 && col < (int32_t)ow) {
+                pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
             }
         }
     }
@@ -371,36 +427,64 @@ static void draw_overlay(Output *out)
         py = app->pointer_y - PREVIEW_SIZE - 4;
     }
 
-    uint32_t color = (0xFFU << 24U) |
-                     (((app->current_color >> 16U) & 0xFFU) << 16U) |
-                     (((app->current_color >>  8U) & 0xFFU) <<  8U) |
-                      ((app->current_color        ) & 0xFFU);
+    /* Zoom the CURSOR_SIZE×CURSOR_SIZE pick region up to PREVIEW_SIZE×PREVIEW_SIZE.
+     * Each source logical pixel maps to a (zoom × zoom) block in the preview.
+     * Source region is centered on the hotspot: [pointer - CURSOR_HOT, pointer + CURSOR_SIZE - CURSOR_HOT). */
+    int32_t zoom        = PREVIEW_SIZE / CURSOR_SIZE;
+    int32_t src_origin_x = app->pointer_x - CURSOR_HOT;
+    int32_t src_origin_y = app->pointer_y - CURSOR_HOT;
 
     for (int32_t dy = 0; dy < PREVIEW_SIZE; dy++) {
         int32_t row = py + dy;
         if (row < 0 || row >= (int32_t)oh) {
             continue;
         }
+        int32_t src_ly = src_origin_y + (dy / zoom);
+
         for (int32_t dx = 0; dx < PREVIEW_SIZE; dx++) {
             int32_t col = px + dx;
             if (col < 0 || col >= (int32_t)ow) {
                 continue;
             }
+            int32_t src_lx = src_origin_x + (dx / zoom);
+
+            uint32_t color;
+            if (!out->pixels ||
+                src_lx < 0 || src_ly < 0 ||
+                (uint32_t)src_lx >= ow || (uint32_t)src_ly >= oh) {
+                color = 0xFF000000U; /* out-of-bounds: opaque black */
+            } else {
+                /* Scale logical → physical coordinates for HiDPI outputs. */
+                size_t phys_x = ((size_t)src_lx * (size_t)out->cap_width)  / (size_t)ow;
+                size_t phys_y = ((size_t)src_ly * (size_t)out->cap_height) / (size_t)oh;
+                size_t offset = (((phys_y * (size_t)out->cap_width) + phys_x) * 4U);
+                uint8_t cb    = out->pixels[offset + 0U];
+                uint8_t cg    = out->pixels[offset + 1U];
+                uint8_t cr    = out->pixels[offset + 2U];
+                color = (0xFFU << 24U) | ((uint32_t)cr << 16U) |
+                        ((uint32_t)cg << 8U) | (uint32_t)cb;
+            }
+
             pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
         }
     }
 
-    /* Render the hex label at the bottom of the preview square.
-     * Pick black or white text based on perceived luminance.      */
+    /* Solid color bar behind the hex label: sampled color, 20px tall.
+     * (label height 18px + 2px top padding above the glyphs)            */
     uint32_t tr = (app->current_color >> 16U) & 0xFFU;
     uint32_t tg = (app->current_color >>  8U) & 0xFFU;
     uint32_t tb =  app->current_color          & 0xFFU;
+    uint32_t bar_color = (0xFFU << 24U) | (tr << 16U) | (tg << 8U) | tb;
+    draw_color_bar(out, pixels, px, py, 20, bar_color);
+
     /* BT.601 integer luminance, range 0..255000; threshold at 127500. */
-    uint32_t luma       = (tr * 299U) + (tg * 587U) + (tb * 114U);
+    uint32_t luma       = ((tr * 299U) + (tg * 587U)) + (tb * 114U);
     uint32_t text_color = (luma > 127500U) ? 0xFF000000U : 0xFFFFFFFFU;
 
-    /* 1-pixel border and hex label in the text contrast color. */
+    /* 1-pixel border around the outer square, marker around the sampled
+     * pixel block, and hex label — all in the text contrast color.       */
     draw_border(out, pixels, px, py, text_color);
+    draw_sample_marker(out, pixels, px, py, text_color);
     draw_label(out, pixels, px, py, text_color);
 }
 

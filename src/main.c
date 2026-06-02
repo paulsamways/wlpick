@@ -39,16 +39,18 @@
 #define CURSOR_SIZE  10    /* side length of the hollow-square cursor, px  */
 #define CURSOR_HOT   5     /* hotspot offset from top-left corner          */
 #define MAX_OUTPUTS  8     /* maximum number of simultaneously tracked outputs */
+#define BTN_RIGHT_EVDEV 273U  /* evdev right mouse button code             */
 
 /* -------------------------------------------------------------------------
  * Phase
  * ---------------------------------------------------------------------- */
 
 typedef enum {
-    PHASE_CAPTURE,   /* waiting for all output captures to complete        */
-    PHASE_PICK,      /* overlays shown; tracking pointer                  */
-    PHASE_CLIPBOARD, /* color written to clipboard; waiting for cancel     */
-    PHASE_DONE,      /* error or clipboard replaced; time to exit          */
+    PHASE_CAPTURE,    /* waiting for all output captures to complete       */
+    PHASE_PICK,       /* overlays shown; tracking pointer                 */
+    PHASE_RECAPTURE,  /* right-click: re-capturing while overlays hidden  */
+    PHASE_CLIPBOARD,  /* color written to clipboard; waiting for cancel   */
+    PHASE_DONE,       /* error or clipboard replaced; time to exit        */
 } Phase;
 
 /* Forward declaration so Output can hold an App pointer. */
@@ -168,6 +170,7 @@ struct App {
     struct wl_shm        *shm;
     struct wl_seat       *seat;
     struct wl_pointer    *pointer;
+    struct wl_keyboard   *keyboard;
     struct wl_data_device_manager *ddm;
     struct wl_data_device         *data_device;
     struct wl_data_source         *data_source;
@@ -225,6 +228,123 @@ static const struct wl_buffer_listener ov_buffer_listener = {
     .release = ov_buffer_release,
 };
 
+/* -------------------------------------------------------------------------
+ * Minimal 5×7 bitmap font for '#', '0'–'9', 'A'–'F'.
+ *
+ * Each entry encodes 7 rows top-to-bottom; each row is 5 pixels wide
+ * (bit 4 = leftmost, bit 0 = rightmost).
+ * ---------------------------------------------------------------------- */
+
+/* clang-format off */
+static const uint8_t font5x7[17][7] = {
+    /* '#' */ {0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x00, 0x00},
+    /* '0' */ {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+    /* '1' */ {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
+    /* '2' */ {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},
+    /* '3' */ {0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E},
+    /* '4' */ {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02},
+    /* '5' */ {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},
+    /* '6' */ {0x07, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E},
+    /* '7' */ {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+    /* '8' */ {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},
+    /* '9' */ {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E},
+    /* 'A' */ {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+    /* 'B' */ {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},
+    /* 'C' */ {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E},
+    /* 'D' */ {0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C},
+    /* 'E' */ {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
+    /* 'F' */ {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},
+};
+/* clang-format on */
+
+/* Map a character to a font5x7 row index; returns -1 if unsupported. */
+static int glyph_index(char ch)
+{
+    if (ch == '#') {
+        return 0;
+    }
+    if (ch >= '0' && ch <= '9') {
+        return 1 + (ch - '0');
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return 11 + (ch - 'A');
+    }
+    return -1;
+}
+
+/* Draw the hex label centred at the bottom of the preview square.
+ * Each font pixel is a 2×2 block for legibility at PREVIEW_SIZE=100.  */
+static void draw_label(Output *out, uint32_t *pixels,
+                       int32_t sq_x, int32_t sq_y, uint32_t text_color)
+{
+    App     *app = out->app;
+    uint32_t ow  = out->ov_width;
+    uint32_t oh  = out->ov_height;
+    /* 7 glyphs × 10px + 6 gaps × 2px = 82px total label width.          */
+    int32_t x0 = sq_x + (int32_t)((PREVIEW_SIZE - 82) / 2);
+    /* 7 rows × 2px = 14px glyph height, 4px bottom margin.             */
+    int32_t y0 = sq_y + (int32_t)(PREVIEW_SIZE - 18);
+
+    if (y0 < 0) {
+        return;
+    }
+
+    for (int ci = 0; ci < 7; ci++) {
+        int gi = glyph_index(app->color_str[ci]);
+        if (gi < 0) {
+            continue;
+        }
+        int32_t gx0 = x0 + (int32_t)(ci * 12); /* 10px glyph + 2px gap */
+
+        for (int gy = 0; gy < 7; gy++) {
+            uint8_t rb = font5x7[gi][gy];
+            for (int gx = 0; gx < 5; gx++) {
+                if (((unsigned)rb & (1U << (unsigned)(4 - gx))) == 0U) {
+                    continue;
+                }
+                int32_t rx = gx0 + (int32_t)(gx * 2);
+                int32_t ry = y0  + (int32_t)(gy * 2);
+                if (rx < 0 || ry < 0 ||
+                    rx + 1 >= (int32_t)ow || ry + 1 >= (int32_t)oh) {
+                    continue;
+                }
+                size_t base = ((size_t)ry * (size_t)ow) + (size_t)rx;
+                pixels[base]                   = text_color;
+                pixels[base + 1U]              = text_color;
+                pixels[base + (size_t)ow]      = text_color;
+                pixels[base + (size_t)ow + 1U] = text_color;
+            }
+        }
+    }
+}
+
+/* Draw a 1-pixel border around the preview square in the given color. */
+static void draw_border(Output *out, uint32_t *pixels,
+                        int32_t sq_x, int32_t sq_y, uint32_t border_color)
+{
+    uint32_t ow = out->ov_width;
+    uint32_t oh = out->ov_height;
+
+    for (int32_t di = -1; di <= PREVIEW_SIZE; di++) {
+        /* Top and bottom edges. */
+        for (int32_t edge = -1; edge <= PREVIEW_SIZE; edge += (PREVIEW_SIZE + 1)) {
+            int32_t row = sq_y + edge;
+            int32_t col = sq_x + di;
+            if (row >= 0 && row < (int32_t)oh && col >= 0 && col < (int32_t)ow) {
+                pixels[((size_t)row * (size_t)ow) + (size_t)col] = border_color;
+            }
+        }
+        /* Left and right edges. */
+        for (int32_t edge = -1; edge <= PREVIEW_SIZE; edge += (PREVIEW_SIZE + 1)) {
+            int32_t row = sq_y + di;
+            int32_t col = sq_x + edge;
+            if (row >= 0 && row < (int32_t)oh && col >= 0 && col < (int32_t)ow) {
+                pixels[((size_t)row * (size_t)ow) + (size_t)col] = border_color;
+            }
+        }
+    }
+}
+
 static void draw_overlay(Output *out)
 {
     uint32_t *pixels = out->ov_pixels[out->ov_back];
@@ -269,6 +389,19 @@ static void draw_overlay(Output *out)
             pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
         }
     }
+
+    /* Render the hex label at the bottom of the preview square.
+     * Pick black or white text based on perceived luminance.      */
+    uint32_t tr = (app->current_color >> 16U) & 0xFFU;
+    uint32_t tg = (app->current_color >>  8U) & 0xFFU;
+    uint32_t tb =  app->current_color          & 0xFFU;
+    /* BT.601 integer luminance, range 0..255000; threshold at 127500. */
+    uint32_t luma       = (tr * 299U) + (tg * 587U) + (tb * 114U);
+    uint32_t text_color = (luma > 127500U) ? 0xFF000000U : 0xFFFFFFFFU;
+
+    /* 1-pixel border and hex label in the text contrast color. */
+    draw_border(out, pixels, px, py, text_color);
+    draw_label(out, pixels, px, py, text_color);
 }
 
 static void commit_overlay(Output *out)
@@ -296,6 +429,34 @@ static void commit_overlay(Output *out)
                              (int32_t)out->ov_height);
     wl_surface_commit(out->overlay_surface);
     wl_display_flush(out->app->display);
+}
+
+/* Commit a fully transparent frame to an overlay surface.
+ * Used before recapture so the preview square does not appear in the
+ * screenshot.  Wayland requests are ordered on the wire, so the compositor
+ * will apply this blank before it renders the captured frame.            */
+static void commit_blank_overlay(Output *out)
+{
+    if (out->ov_busy[out->ov_back]) {
+        int alt = out->ov_back ^ 1;
+        if (out->ov_busy[alt]) {
+            return; /* both busy; last committed frame was already blank   */
+        }
+        out->ov_back = alt;
+    }
+
+    memset(out->ov_pixels[out->ov_back], 0, out->ov_pixels_size);
+
+    int b = out->ov_back;
+    out->ov_busy[b] = 1;
+    out->ov_back    = b ^ 1;
+
+    wl_surface_attach(out->overlay_surface, out->ov_buf[b], 0, 0);
+    wl_surface_damage_buffer(out->overlay_surface, 0, 0,
+                             (int32_t)out->ov_width, (int32_t)out->ov_height);
+    wl_surface_commit(out->overlay_surface);
+    /* No flush here – start_recapture flushes once after all sessions are
+     * created, sending everything in a single batch.                     */
 }
 
 static void draw_cursor(App *app)
@@ -433,11 +594,47 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
     commit_overlay(app->active_output);
 }
 
+/* Forward declaration – defined after the capture session callbacks. */
+static const struct ext_image_copy_capture_session_v1_listener
+    capture_session_listener;
+
+/* Hide cursor and restart captures so right-click refreshes the frame. */
+static void start_recapture(App *app)
+{
+    /* Commit a blank frame to every overlay so the preview square does not
+     * appear in the recaptured screenshot.  Wayland requests are ordered
+     * on the wire, so these blank commits arrive at the compositor before
+     * the capture frame request and will be applied first.               */
+    for (int i = 0; i < app->output_count; i++) {
+        commit_blank_overlay(&app->outputs[i]);
+    }
+
+    /* Hide the cursor so it does not appear in the capture. */
+    wl_pointer_set_cursor(app->pointer, app->pointer_serial, NULL, 0, 0);
+
+    app->phase            = PHASE_RECAPTURE;
+    app->captures_pending = app->output_count;
+
+    for (int i = 0; i < app->output_count; i++) {
+        Output *out = &app->outputs[i];
+        out->capture_source =
+            ext_output_image_capture_source_manager_v1_create_source(
+                app->capture_src_mgr, out->wl_output);
+        out->capture_session =
+            ext_image_copy_capture_manager_v1_create_session(
+                app->capture_mgr, out->capture_source, 0);
+        ext_image_copy_capture_session_v1_add_listener(
+            out->capture_session, &capture_session_listener, out);
+    }
+
+    wl_display_flush(app->display);
+}
+
 static void pointer_button(void *data, struct wl_pointer *pointer,
                             uint32_t serial, uint32_t time,
                             uint32_t button, uint32_t state)
 {
-    (void)pointer; (void)time; (void)button;
+    (void)pointer; (void)time;
     App *app = data;
 
     if (app->phase != PHASE_PICK) {
@@ -445,6 +642,11 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     }
 
     if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
+        return;
+    }
+
+    if (button == BTN_RIGHT_EVDEV) {
+        start_recapture(app);
         return;
     }
 
@@ -525,6 +727,69 @@ static const struct wl_pointer_listener pointer_listener = {
  * Seat listener
  * ---------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------
+ * Keyboard listener – only used to detect Escape for cancellation.
+ * ---------------------------------------------------------------------- */
+
+#define KEY_ESC_EVDEV   1U
+
+static void keyboard_keymap(void *data, struct wl_keyboard *kb,
+                             uint32_t format, int32_t fd, uint32_t size)
+{
+    (void)data; (void)kb; (void)format; (void)size;
+    close(fd);
+}
+
+static void keyboard_enter(void *data, struct wl_keyboard *kb,
+                            uint32_t serial, struct wl_surface *surface,
+                            struct wl_array *keys)
+{
+    (void)data; (void)kb; (void)serial; (void)surface; (void)keys;
+}
+
+static void keyboard_leave(void *data, struct wl_keyboard *kb,
+                            uint32_t serial, struct wl_surface *surface)
+{
+    (void)data; (void)kb; (void)serial; (void)surface;
+}
+
+static void keyboard_key(void *data, struct wl_keyboard *kb,
+                          uint32_t serial, uint32_t time,
+                          uint32_t key, uint32_t state)
+{
+    (void)kb; (void)serial; (void)time;
+    App *app = data;
+    if (key == KEY_ESC_EVDEV && state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        app->phase = PHASE_DONE;
+    }
+}
+
+static void keyboard_modifiers(void *data, struct wl_keyboard *kb,
+                                uint32_t serial,
+                                uint32_t mods_depressed,
+                                uint32_t mods_latched,
+                                uint32_t mods_locked,
+                                uint32_t group)
+{
+    (void)data; (void)kb; (void)serial;
+    (void)mods_depressed; (void)mods_latched; (void)mods_locked; (void)group;
+}
+
+static void keyboard_repeat_info(void *data, struct wl_keyboard *kb,
+                                  int32_t rate, int32_t delay)
+{
+    (void)data; (void)kb; (void)rate; (void)delay;
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+    .keymap      = keyboard_keymap,
+    .enter       = keyboard_enter,
+    .leave       = keyboard_leave,
+    .key         = keyboard_key,
+    .modifiers   = keyboard_modifiers,
+    .repeat_info = keyboard_repeat_info,
+};
+
 static void seat_capabilities(void *data, struct wl_seat *seat,
                                uint32_t caps)
 {
@@ -533,6 +798,10 @@ static void seat_capabilities(void *data, struct wl_seat *seat,
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !app->pointer) {
         app->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(app->pointer, &pointer_listener, app);
+    }
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !app->keyboard) {
+        app->keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(app->keyboard, &keyboard_listener, app);
     }
 }
 
@@ -663,7 +932,7 @@ static void start_pick_phase(App *app)
         zwlr_layer_surface_v1_set_exclusive_zone(out->layer_surface, -1);
         zwlr_layer_surface_v1_set_keyboard_interactivity(
             out->layer_surface,
-            ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+            ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
 
         zwlr_layer_surface_v1_add_listener(out->layer_surface,
                                             &layer_surface_listener, out);
@@ -719,8 +988,22 @@ static void capture_frame_ready(void *data,
     app->captures_pending--;
 
     if (app->captures_pending == 0) {
-        /* All outputs captured; build the pick overlay. */
-        start_pick_phase(app);
+        if (app->phase == PHASE_RECAPTURE) {
+            /* Re-capture complete: restore the cursor and resume picking. */
+            wl_pointer_set_cursor(app->pointer, app->pointer_serial,
+                                  app->cursor_surface, CURSOR_HOT, CURSOR_HOT);
+            app->phase = PHASE_PICK;
+            /* Immediately redraw the overlay on whichever output the pointer
+             * is currently on so the preview reappears without a mouse move. */
+            if (app->active_output) {
+                sample_color(app);
+                draw_overlay(app->active_output);
+                commit_overlay(app->active_output);
+            }
+        } else {
+            /* Initial capture complete; build the pick overlay. */
+            start_pick_phase(app);
+        }
     }
 }
 
@@ -791,14 +1074,18 @@ static void capture_session_done(void *data,
         return;
     }
 
-    out->pixels_size = ((size_t)out->cap_width * (size_t)out->cap_height) * 4U;
-    out->pixels = create_shm_buffer(app->shm,
-                                    out->cap_width, out->cap_height,
-                                    &out->capture_buf);
+    /* On re-capture the pixel buffer already exists; reuse it.  On the first
+     * capture allocate a new shared-memory buffer and mmap it.            */
     if (!out->pixels) {
-        fprintf(stderr, "Failed to allocate screen capture buffer\n");
-        app->phase = PHASE_DONE;
-        return;
+        out->pixels_size = ((size_t)out->cap_width * (size_t)out->cap_height) * 4U;
+        out->pixels = create_shm_buffer(app->shm,
+                                        out->cap_width, out->cap_height,
+                                        &out->capture_buf);
+        if (!out->pixels) {
+            fprintf(stderr, "Failed to allocate screen capture buffer\n");
+            app->phase = PHASE_DONE;
+            return;
+        }
     }
 
     /* Create the frame, attach listener, and fire the capture – all client-
@@ -824,7 +1111,7 @@ static void capture_session_stopped(void *data,
     Output *out = data;
     App *app = out->app;
 
-    if (app->phase == PHASE_CAPTURE) {
+    if (app->phase == PHASE_CAPTURE || app->phase == PHASE_RECAPTURE) {
         fprintf(stderr, "Capture session stopped before frame was ready\n");
         app->phase = PHASE_DONE;
     }
@@ -1033,9 +1320,16 @@ int main(void)
      *   CAPTURE → all frames ready → start_pick_phase → configure events
      *   → PICK → button click → CLIPBOARD / DONE
      */
-    while ((app.phase == PHASE_CAPTURE || app.phase == PHASE_PICK) &&
+    while ((app.phase == PHASE_CAPTURE ||
+            app.phase == PHASE_PICK    ||
+            app.phase == PHASE_RECAPTURE) &&
            wl_display_dispatch(app.display) >= 0) {
         /* nothing */
+    }
+
+    if (app.phase == PHASE_DONE) {
+        /* User pressed Escape – clean cancellation. */
+        return 0;
     }
 
     if (app.phase != PHASE_CLIPBOARD) {

@@ -39,7 +39,6 @@
 #define CURSOR_SIZE  11    /* side length of the hollow-square cursor, px  */
 #define CURSOR_HOT   5     /* hotspot offset from top-left corner          */
 #define MAX_OUTPUTS  8     /* maximum number of simultaneously tracked outputs */
-#define BTN_RIGHT_EVDEV 273U  /* evdev right mouse button code             */
 
 /* -------------------------------------------------------------------------
  * Phase
@@ -48,7 +47,6 @@
 typedef enum {
     PHASE_CAPTURE,    /* waiting for all output captures to complete       */
     PHASE_PICK,       /* overlays shown; tracking pointer                 */
-    PHASE_RECAPTURE,  /* right-click: re-capturing while overlays hidden  */
     PHASE_CLIPBOARD,  /* color written to clipboard; waiting for cancel   */
     PHASE_DONE,       /* error or clipboard replaced; time to exit        */
 } Phase;
@@ -401,6 +399,31 @@ static void draw_border(Output *out, uint32_t *pixels,
     }
 }
 
+/* Fill the overlay buffer with a scaled copy of the captured screen pixels.
+ * Falls back to opaque black if no capture is available yet.               */
+static void draw_background(Output *out, uint32_t *pixels)
+{
+    if (!out->pixels || !out->ov_width || !out->ov_height) {
+        memset(pixels, 0, out->ov_pixels_size);
+        return;
+    }
+    uint32_t ow = out->ov_width;
+    uint32_t oh = out->ov_height;
+    for (uint32_t y = 0; y < oh; y++) {
+        size_t phys_y = ((size_t)y * (size_t)out->cap_height) / (size_t)oh;
+        for (uint32_t x = 0; x < ow; x++) {
+            size_t phys_x = ((size_t)x * (size_t)out->cap_width) / (size_t)ow;
+            size_t  off   = (phys_y * (size_t)out->cap_width + phys_x) * 4U;
+            uint8_t cb    = out->pixels[off + 0U];
+            uint8_t cg    = out->pixels[off + 1U];
+            uint8_t cr    = out->pixels[off + 2U];
+            pixels[(size_t)y * (size_t)ow + (size_t)x] =
+                (0xFFU << 24U) | ((uint32_t)cr << 16U) |
+                ((uint32_t)cg <<  8U) | (uint32_t)cb;
+        }
+    }
+}
+
 static void draw_overlay(Output *out)
 {
     uint32_t *pixels = out->ov_pixels[out->ov_back];
@@ -412,8 +435,8 @@ static void draw_overlay(Output *out)
     uint32_t ow = out->ov_width;
     uint32_t oh = out->ov_height;
 
-    /* Fully transparent background. */
-    memset(pixels, 0, out->ov_pixels_size);
+    /* Paint the frozen screen capture as the background. */
+    draw_background(out, pixels);
 
     /* Draw the color preview square next to the cursor.
      * Prefer right+below; clamp to the surface edge.     */
@@ -513,34 +536,6 @@ static void commit_overlay(Output *out)
                              (int32_t)out->ov_height);
     wl_surface_commit(out->overlay_surface);
     wl_display_flush(out->app->display);
-}
-
-/* Commit a fully transparent frame to an overlay surface.
- * Used before recapture so the preview square does not appear in the
- * screenshot.  Wayland requests are ordered on the wire, so the compositor
- * will apply this blank before it renders the captured frame.            */
-static void commit_blank_overlay(Output *out)
-{
-    if (out->ov_busy[out->ov_back]) {
-        int alt = out->ov_back ^ 1;
-        if (out->ov_busy[alt]) {
-            return; /* both busy; last committed frame was already blank   */
-        }
-        out->ov_back = alt;
-    }
-
-    memset(out->ov_pixels[out->ov_back], 0, out->ov_pixels_size);
-
-    int b = out->ov_back;
-    out->ov_busy[b] = 1;
-    out->ov_back    = b ^ 1;
-
-    wl_surface_attach(out->overlay_surface, out->ov_buf[b], 0, 0);
-    wl_surface_damage_buffer(out->overlay_surface, 0, 0,
-                             (int32_t)out->ov_width, (int32_t)out->ov_height);
-    wl_surface_commit(out->overlay_surface);
-    /* No flush here – start_recapture flushes once after all sessions are
-     * created, sending everything in a single batch.                     */
 }
 
 static void draw_cursor(App *app)
@@ -646,7 +641,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
             int b = out->ov_back;
             out->ov_busy[b] = 1;
             out->ov_back    = b ^ 1;
-            memset(out->ov_pixels[b], 0, out->ov_pixels_size);
+            draw_background(out, out->ov_pixels[b]);
             wl_surface_attach(out->overlay_surface, out->ov_buf[b], 0, 0);
             wl_surface_damage_buffer(out->overlay_surface, 0, 0,
                                      (int32_t)out->ov_width,
@@ -682,43 +677,12 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
 static const struct ext_image_copy_capture_session_v1_listener
     capture_session_listener;
 
-/* Hide cursor and restart captures so right-click refreshes the frame. */
-static void start_recapture(App *app)
-{
-    /* Commit a blank frame to every overlay so the preview square does not
-     * appear in the recaptured screenshot.  Wayland requests are ordered
-     * on the wire, so these blank commits arrive at the compositor before
-     * the capture frame request and will be applied first.               */
-    for (int i = 0; i < app->output_count; i++) {
-        commit_blank_overlay(&app->outputs[i]);
-    }
-
-    /* Hide the cursor so it does not appear in the capture. */
-    wl_pointer_set_cursor(app->pointer, app->pointer_serial, NULL, 0, 0);
-
-    app->phase            = PHASE_RECAPTURE;
-    app->captures_pending = app->output_count;
-
-    for (int i = 0; i < app->output_count; i++) {
-        Output *out = &app->outputs[i];
-        out->capture_source =
-            ext_output_image_capture_source_manager_v1_create_source(
-                app->capture_src_mgr, out->wl_output);
-        out->capture_session =
-            ext_image_copy_capture_manager_v1_create_session(
-                app->capture_mgr, out->capture_source, 0);
-        ext_image_copy_capture_session_v1_add_listener(
-            out->capture_session, &capture_session_listener, out);
-    }
-
-    wl_display_flush(app->display);
-}
 
 static void pointer_button(void *data, struct wl_pointer *pointer,
                             uint32_t serial, uint32_t time,
                             uint32_t button, uint32_t state)
 {
-    (void)pointer; (void)time;
+    (void)pointer; (void)time; (void)button;
     App *app = data;
 
     if (app->phase != PHASE_PICK) {
@@ -726,11 +690,6 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     }
 
     if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
-        return;
-    }
-
-    if (button == BTN_RIGHT_EVDEV) {
-        start_recapture(app);
         return;
     }
 
@@ -955,12 +914,12 @@ static void layer_surface_configure(void *data,
         wl_surface_commit(app->cursor_surface);
     }
 
-    /* Initial commit: fully transparent so no preview appears until the
-     * pointer actually enters this output.                               */
+    /* Initial commit: paint the frozen screen capture so the overlay is
+     * immediately opaque and consistent before the pointer enters.       */
     int ini_b = out->ov_back;
     out->ov_busy[ini_b] = 1;
     out->ov_back = ini_b ^ 1;
-    memset(out->ov_pixels[ini_b], 0, out->ov_pixels_size);
+    draw_background(out, out->ov_pixels[ini_b]);
     wl_surface_attach(out->overlay_surface, out->ov_buf[ini_b], 0, 0);
     wl_surface_damage_buffer(out->overlay_surface, 0, 0,
                              (int32_t)out->ov_width, (int32_t)out->ov_height);
@@ -1072,22 +1031,8 @@ static void capture_frame_ready(void *data,
     app->captures_pending--;
 
     if (app->captures_pending == 0) {
-        if (app->phase == PHASE_RECAPTURE) {
-            /* Re-capture complete: restore the cursor and resume picking. */
-            wl_pointer_set_cursor(app->pointer, app->pointer_serial,
-                                  app->cursor_surface, CURSOR_HOT, CURSOR_HOT);
-            app->phase = PHASE_PICK;
-            /* Immediately redraw the overlay on whichever output the pointer
-             * is currently on so the preview reappears without a mouse move. */
-            if (app->active_output) {
-                sample_color(app);
-                draw_overlay(app->active_output);
-                commit_overlay(app->active_output);
-            }
-        } else {
-            /* Initial capture complete; build the pick overlay. */
-            start_pick_phase(app);
-        }
+        /* Initial capture complete; build the pick overlay. */
+        start_pick_phase(app);
     }
 }
 
@@ -1195,7 +1140,7 @@ static void capture_session_stopped(void *data,
     Output *out = data;
     App *app = out->app;
 
-    if (app->phase == PHASE_CAPTURE || app->phase == PHASE_RECAPTURE) {
+    if (app->phase == PHASE_CAPTURE) {
         fprintf(stderr, "Capture session stopped before frame was ready\n");
         app->phase = PHASE_DONE;
     }
@@ -1405,8 +1350,7 @@ int main(void)
      *   → PICK → button click → CLIPBOARD / DONE
      */
     while ((app.phase == PHASE_CAPTURE ||
-            app.phase == PHASE_PICK    ||
-            app.phase == PHASE_RECAPTURE) &&
+            app.phase == PHASE_PICK) &&
            wl_display_dispatch(app.display) >= 0) {
         /* nothing */
     }

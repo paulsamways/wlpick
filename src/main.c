@@ -152,8 +152,14 @@ typedef struct {
     /* Two buffers: we write into [back] while compositor reads [front].  */
     uint32_t        *ov_pixels[2];
     struct wl_buffer *ov_buf[2];
-    int               ov_back;  /* index of the buffer we write into (0|1) */
-    int               ov_busy[2]; /* 1 = compositor still holds the buffer */
+    int               ov_back;    /* index of the buffer we write into (0|1) */
+    int               ov_busy[2]; /* 1 = compositor still holds the buffer  */
+    int32_t           prev_px[2]; /* preview x per buffer; INT32_MIN = clean */
+    int32_t           prev_py[2]; /* preview y per buffer; INT32_MIN = clean */
+    int32_t           damage_x;   /* dirty rect written by draw_overlay      */
+    int32_t           damage_y;
+    int32_t           damage_w;
+    int32_t           damage_h;
 } Output;
 
 /* -------------------------------------------------------------------------
@@ -401,70 +407,103 @@ static void draw_border(Output *out, uint32_t *pixels,
 
 /* Fill the overlay buffer with a scaled copy of the captured screen pixels.
  * Falls back to opaque black if no capture is available yet.               */
-static void draw_background(Output *out, uint32_t *pixels)
+/* Copy a rectangle of captured screen pixels (in logical coordinates) into the
+ * overlay buffer.  Coordinates are clamped to the surface bounds internally.  */
+static void blit_capture_rect(Output *out, uint32_t *pixels,
+                               int32_t rx, int32_t ry,
+                               int32_t rw, int32_t rh)
 {
-    if (!out->pixels || !out->ov_width || !out->ov_height) {
-        memset(pixels, 0, out->ov_pixels_size);
-        return;
-    }
     uint32_t ow = out->ov_width;
     uint32_t oh = out->ov_height;
-    for (uint32_t y = 0; y < oh; y++) {
-        size_t phys_y = ((size_t)y * (size_t)out->cap_height) / (size_t)oh;
-        for (uint32_t x = 0; x < ow; x++) {
-            size_t phys_x = ((size_t)x * (size_t)out->cap_width) / (size_t)ow;
-            size_t  off   = (phys_y * (size_t)out->cap_width + phys_x) * 4U;
-            uint8_t cb    = out->pixels[off + 0U];
-            uint8_t cg    = out->pixels[off + 1U];
-            uint8_t cr    = out->pixels[off + 2U];
-            pixels[(size_t)y * (size_t)ow + (size_t)x] =
+    int32_t  x0 = (rx < 0) ? 0 : rx;
+    int32_t  y0 = (ry < 0) ? 0 : ry;
+    int32_t  x1 = ((rx + rw) > (int32_t)ow) ? (int32_t)ow : (rx + rw);
+    int32_t  y1 = ((ry + rh) > (int32_t)oh) ? (int32_t)oh : (ry + rh);
+
+    for (int32_t row = y0; row < y1; row++) {
+        size_t phys_y = ((size_t)row * (size_t)out->cap_height) / (size_t)oh;
+        for (int32_t col = x0; col < x1; col++) {
+            size_t  phys_x = ((size_t)col * (size_t)out->cap_width) / (size_t)ow;
+            size_t  off    = ((phys_y * (size_t)out->cap_width) + phys_x) * 4U;
+            uint8_t cb     = out->pixels[off + 0U];
+            uint8_t cg     = out->pixels[off + 1U];
+            uint8_t cr     = out->pixels[off + 2U];
+            pixels[((size_t)row * (size_t)ow) + (size_t)col] =
                 (0xFFU << 24U) | ((uint32_t)cr << 16U) |
                 ((uint32_t)cg <<  8U) | (uint32_t)cb;
         }
     }
 }
 
+/* Compute the union of the new and (if any) old preview dirty rects and store
+ * it in out->damage_*.  Each rect is PREVIEW_SIZE+2 wide/tall, starting 1px
+ * before the square corner to include the 1-pixel border.                  */
+static void update_damage_rect(Output *out,
+                                int32_t px, int32_t py,
+                                int32_t old_px, int32_t old_py)
+{
+    int32_t dx0 = px - 1;
+    int32_t dy0 = py - 1;
+    int32_t dx1 = px + (int32_t)PREVIEW_SIZE + 1;
+    int32_t dy1 = py + (int32_t)PREVIEW_SIZE + 1;
+    if (old_px != INT32_MIN) {
+        if ((old_px - 1) < dx0) { dx0 = old_px - 1; }
+        if ((old_py - 1) < dy0) { dy0 = old_py - 1; }
+        if ((old_px + (int32_t)PREVIEW_SIZE + 1) > dx1) { dx1 = old_px + (int32_t)PREVIEW_SIZE + 1; }
+        if ((old_py + (int32_t)PREVIEW_SIZE + 1) > dy1) { dy1 = old_py + (int32_t)PREVIEW_SIZE + 1; }
+    }
+    out->damage_x = dx0;
+    out->damage_y = dy0;
+    out->damage_w = dx1 - dx0;
+    out->damage_h = dy1 - dy0;
+}
+
 static void draw_overlay(Output *out)
 {
-    uint32_t *pixels = out->ov_pixels[out->ov_back];
+    int       bi     = out->ov_back;
+    uint32_t *pixels = out->ov_pixels[bi];
     if (!pixels) {
         return;
     }
 
-    App *app = out->app;
-    uint32_t ow = out->ov_width;
-    uint32_t oh = out->ov_height;
+    App     *app = out->app;
+    uint32_t ow  = out->ov_width;
+    uint32_t oh  = out->ov_height;
 
-    /* Paint the frozen screen capture as the background. */
-    draw_background(out, pixels);
-
-    /* Draw the color preview square next to the cursor.
-     * Prefer right+below; clamp to the surface edge.     */
-    int32_t px = app->pointer_x + CURSOR_SIZE + 4;
-    int32_t py = app->pointer_y + CURSOR_SIZE + 4;
-
-    if (px + PREVIEW_SIZE > (int32_t)ow) {
-        px = app->pointer_x - PREVIEW_SIZE - 4;
-    }
-    if (py + PREVIEW_SIZE > (int32_t)oh) {
-        py = app->pointer_y - PREVIEW_SIZE - 4;
+    /* Restore only the region this buffer previously had a preview square in,
+     * rather than repainting the entire background on every mouse move.     */
+    int32_t old_px = out->prev_px[bi];
+    int32_t old_py = out->prev_py[bi];
+    if (old_px != INT32_MIN) {
+        blit_capture_rect(out, pixels,
+                          old_px - 1, old_py - 1,
+                          (int32_t)PREVIEW_SIZE + 2, (int32_t)PREVIEW_SIZE + 2);
     }
 
-    /* Zoom the CURSOR_SIZE×CURSOR_SIZE pick region up to PREVIEW_SIZE×PREVIEW_SIZE.
-     * Each source logical pixel maps to a (zoom × zoom) block in the preview.
-     * Source region is centered on the hotspot: [pointer - CURSOR_HOT, pointer + CURSOR_SIZE - CURSOR_HOT). */
-    int32_t zoom        = PREVIEW_SIZE / CURSOR_SIZE;
-    int32_t src_origin_x = app->pointer_x - CURSOR_HOT;
-    int32_t src_origin_y = app->pointer_y - CURSOR_HOT;
+    /* Position the preview square (prefer right+below; clamp to edge). */
+    int32_t px = app->pointer_x + (int32_t)CURSOR_SIZE + 4;
+    int32_t py = app->pointer_y + (int32_t)CURSOR_SIZE + 4;
+    if (px + (int32_t)PREVIEW_SIZE > (int32_t)ow) {
+        px = app->pointer_x - (int32_t)PREVIEW_SIZE - 4;
+    }
+    if (py + (int32_t)PREVIEW_SIZE > (int32_t)oh) {
+        py = app->pointer_y - (int32_t)PREVIEW_SIZE - 4;
+    }
 
-    for (int32_t dy = 0; dy < PREVIEW_SIZE; dy++) {
+    /* Zoom CURSOR_SIZE×CURSOR_SIZE pick region to PREVIEW_SIZE×PREVIEW_SIZE.
+     * Each source pixel maps to a zoom×zoom block; region centered on hotspot. */
+    int32_t zoom         = (int32_t)PREVIEW_SIZE / (int32_t)CURSOR_SIZE;
+    int32_t src_origin_x = app->pointer_x - (int32_t)CURSOR_HOT;
+    int32_t src_origin_y = app->pointer_y - (int32_t)CURSOR_HOT;
+
+    for (int32_t dy = 0; dy < (int32_t)PREVIEW_SIZE; dy++) {
         int32_t row = py + dy;
         if (row < 0 || row >= (int32_t)oh) {
             continue;
         }
         int32_t src_ly = src_origin_y + (dy / zoom);
 
-        for (int32_t dx = 0; dx < PREVIEW_SIZE; dx++) {
+        for (int32_t dx = 0; dx < (int32_t)PREVIEW_SIZE; dx++) {
             int32_t col = px + dx;
             if (col < 0 || col >= (int32_t)ow) {
                 continue;
@@ -477,7 +516,6 @@ static void draw_overlay(Output *out)
                 (uint32_t)src_lx >= ow || (uint32_t)src_ly >= oh) {
                 color = 0xFF000000U; /* out-of-bounds: opaque black */
             } else {
-                /* Scale logical → physical coordinates for HiDPI outputs. */
                 size_t phys_x = ((size_t)src_lx * (size_t)out->cap_width)  / (size_t)ow;
                 size_t phys_y = ((size_t)src_ly * (size_t)out->cap_height) / (size_t)oh;
                 size_t offset = (((phys_y * (size_t)out->cap_width) + phys_x) * 4U);
@@ -487,28 +525,27 @@ static void draw_overlay(Output *out)
                 color = (0xFFU << 24U) | ((uint32_t)cr << 16U) |
                         ((uint32_t)cg << 8U) | (uint32_t)cb;
             }
-
             pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
         }
     }
 
-    /* Solid color bar behind the hex label: sampled color, 20px tall.
-     * (label height 18px + 2px top padding above the glyphs)            */
     uint32_t tr = (app->current_color >> 16U) & 0xFFU;
     uint32_t tg = (app->current_color >>  8U) & 0xFFU;
     uint32_t tb =  app->current_color          & 0xFFU;
     uint32_t bar_color = (0xFFU << 24U) | (tr << 16U) | (tg << 8U) | tb;
     draw_color_bar(out, pixels, px, py, 20, bar_color);
 
-    /* BT.601 integer luminance, range 0..255000; threshold at 127500. */
     uint32_t luma       = ((tr * 299U) + (tg * 587U)) + (tb * 114U);
     uint32_t text_color = (luma > 127500U) ? 0xFF000000U : 0xFFFFFFFFU;
 
-    /* 1-pixel border around the outer square, marker around the sampled
-     * pixel block, and hex label — all in the text contrast color.       */
     draw_border(out, pixels, px, py, text_color);
     draw_sample_marker(out, pixels, px, py, text_color);
     draw_label(out, pixels, px, py, text_color);
+
+    /* Record dirty region for next repair and compute partial damage rect. */
+    out->prev_px[bi] = px;
+    out->prev_py[bi] = py;
+    update_damage_rect(out, px, py, old_px, old_py);
 }
 
 static void commit_overlay(Output *out)
@@ -531,9 +568,8 @@ static void commit_overlay(Output *out)
 
     wl_surface_attach(out->overlay_surface, out->ov_buf[b], 0, 0);
     wl_surface_damage_buffer(out->overlay_surface,
-                             0, 0,
-                             (int32_t)out->ov_width,
-                             (int32_t)out->ov_height);
+                             out->damage_x, out->damage_y,
+                             out->damage_w, out->damage_h);
     wl_surface_commit(out->overlay_surface);
     wl_display_flush(out->app->display);
 }
@@ -637,19 +673,31 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
      * sends a leave event for a proxy the client has already destroyed.  */
     for (int i = 0; i < app->output_count; i++) {
         Output *out = &app->outputs[i];
-        if (surface && out->overlay_surface == surface && out->ov_pixels[out->ov_back]) {
-            int b = out->ov_back;
-            out->ov_busy[b] = 1;
-            out->ov_back    = b ^ 1;
-            draw_background(out, out->ov_pixels[b]);
-            wl_surface_attach(out->overlay_surface, out->ov_buf[b], 0, 0);
-            wl_surface_damage_buffer(out->overlay_surface, 0, 0,
-                                     (int32_t)out->ov_width,
-                                     (int32_t)out->ov_height);
-            wl_surface_commit(out->overlay_surface);
-            wl_display_flush(app->display);
-            break;
+        if (!surface || out->overlay_surface != surface ||
+            !out->ov_pixels[out->ov_back]) {
+            continue;
         }
+        int     bi  = out->ov_back;
+        int32_t opx = out->prev_px[bi];
+        int32_t opy = out->prev_py[bi];
+        if (opx == INT32_MIN) {
+            break; /* buffer already clean, nothing to erase */
+        }
+        out->ov_busy[bi] = 1;
+        out->ov_back     = bi ^ 1;
+        blit_capture_rect(out, out->ov_pixels[bi],
+                          opx - 1, opy - 1,
+                          (int32_t)PREVIEW_SIZE + 2, (int32_t)PREVIEW_SIZE + 2);
+        out->prev_px[bi] = INT32_MIN;
+        out->prev_py[bi] = INT32_MIN;
+        wl_surface_attach(out->overlay_surface, out->ov_buf[bi], 0, 0);
+        wl_surface_damage_buffer(out->overlay_surface,
+                                 opx - 1, opy - 1,
+                                 (int32_t)PREVIEW_SIZE + 2,
+                                 (int32_t)PREVIEW_SIZE + 2);
+        wl_surface_commit(out->overlay_surface);
+        wl_display_flush(app->display);
+        break;
     }
 
     app->active_output = NULL;
@@ -894,6 +942,16 @@ static void layer_surface_configure(void *data,
     }
     out->ov_back = 0;
 
+    /* Blit the captured screen into both buffers so neither ever needs a full
+     * repaint — draw_overlay will repair only the small preview region.     */
+    for (int bi = 0; bi < 2; bi++) {
+        blit_capture_rect(out, out->ov_pixels[bi],
+                          0, 0,
+                          (int32_t)out->ov_width, (int32_t)out->ov_height);
+        out->prev_px[bi] = INT32_MIN;
+        out->prev_py[bi] = INT32_MIN;
+    }
+
     /* Set up the shared cursor surface exactly once (on the first configure). */
     if (!app->cursor_pixels) {
         app->cursor_pixels_size =
@@ -914,12 +972,11 @@ static void layer_surface_configure(void *data,
         wl_surface_commit(app->cursor_surface);
     }
 
-    /* Initial commit: paint the frozen screen capture so the overlay is
-     * immediately opaque and consistent before the pointer enters.       */
+    /* Initial commit: background is already painted above; full damage because
+     * the compositor has never seen this buffer before.                     */
     int ini_b = out->ov_back;
     out->ov_busy[ini_b] = 1;
     out->ov_back = ini_b ^ 1;
-    draw_background(out, out->ov_pixels[ini_b]);
     wl_surface_attach(out->overlay_surface, out->ov_buf[ini_b], 0, 0);
     wl_surface_damage_buffer(out->overlay_surface, 0, 0,
                              (int32_t)out->ov_width, (int32_t)out->ov_height);

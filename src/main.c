@@ -597,17 +597,33 @@ static void commit_overlay(Output *out)
     wl_display_flush(out->app->display);
 }
 
-static void draw_cursor(App *app)
+static void draw_cursor(App *app, uint32_t color)
 {
-    /* Draw a CURSOR_SIZE × CURSOR_SIZE hollow white square, 1px border. */
     for (int cy = 0; cy < CURSOR_SIZE; cy++) {
         for (int cx = 0; cx < CURSOR_SIZE; cx++) {
             int border = (cx == 0 || cx == CURSOR_SIZE - 1 ||
                           cy == 0 || cy == CURSOR_SIZE - 1);
             app->cursor_pixels[((size_t)cy * (size_t)CURSOR_SIZE) + (size_t)cx] =
-                border ? 0xFFFFFFFFU : 0x00000000U;
+                border ? color : 0x00000000U;
         }
     }
+}
+
+static void update_cursor_color(App *app)
+{
+    if (!app->cursor_pixels) {
+        return;
+    }
+    uint32_t tr    = (app->current_color >> 16U) & 0xFFU;
+    uint32_t tg    = (app->current_color >>  8U) & 0xFFU;
+    uint32_t tb    =  app->current_color          & 0xFFU;
+    uint32_t luma  = ((tr * 299U) + (tg * 587U)) + (tb * 114U);
+    uint32_t color = (luma > 127500U) ? 0xFF000000U : 0xFFFFFFFFU;
+    draw_cursor(app, color);
+    wl_surface_attach(app->cursor_surface, app->cursor_buf, 0, 0);
+    wl_surface_damage_buffer(app->cursor_surface,
+                             0, 0, CURSOR_SIZE, CURSOR_SIZE);
+    wl_surface_commit(app->cursor_surface);
 }
 
 /* -------------------------------------------------------------------------
@@ -678,6 +694,7 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
         app->pointer_x = wl_fixed_to_int(sx);
         app->pointer_y = wl_fixed_to_int(sy);
         sample_color(app);
+        update_cursor_color(app);
         commit_overlay(app->active_output);
     }
 }
@@ -747,6 +764,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
     app->pointer_y = wl_fixed_to_int(sy);
 
     sample_color(app);
+    update_cursor_color(app);
     commit_overlay(app->active_output);
 }
 
@@ -1011,7 +1029,7 @@ static void layer_surface_configure(void *data,
             app->phase = PHASE_DONE;
             return;
         }
-        draw_cursor(app);
+        draw_cursor(app, 0xFFFFFFFFU);
         wl_surface_attach(app->cursor_surface, app->cursor_buf, 0, 0);
         wl_surface_damage_buffer(app->cursor_surface,
                                  0, 0, CURSOR_SIZE, CURSOR_SIZE);

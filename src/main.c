@@ -29,6 +29,7 @@
 /* Generated protocol headers (produced by wayland-scanner at build time). */
 #include "build/ext-image-capture-source-v1-protocol.h"
 #include "build/ext-image-copy-capture-v1-protocol.h"
+#include "build/viewporter-protocol.h"
 #include "build/wlr-layer-shell-unstable-v1-protocol.h"
 
 /* -------------------------------------------------------------------------
@@ -160,6 +161,13 @@ typedef struct {
     int32_t           damage_y;
     int32_t           damage_w;
     int32_t           damage_h;
+
+    /* ── Viewport (fractional-scale fix) ────────────────────────────────── */
+    struct wp_viewport *viewport;
+    uint32_t  log_width;           /* logical surface size from configure    */
+    uint32_t  log_height;
+    int32_t   preview_px;          /* PREVIEW_SIZE scaled to physical pixels */
+    int32_t   glyph_scale;         /* font block size in physical pixels     */
 } Output;
 
 /* -------------------------------------------------------------------------
@@ -183,6 +191,7 @@ struct App {
     struct ext_output_image_capture_source_manager_v1 *capture_src_mgr;
     struct ext_image_copy_capture_manager_v1           *capture_mgr;
     struct zwlr_layer_shell_v1                         *layer_shell;
+    struct wp_viewporter                               *viewporter;
 
     /* ── Outputs ───────────────────────────────────────────────────────── */
     Output outputs[MAX_OUTPUTS];
@@ -276,19 +285,42 @@ static int glyph_index(char ch)
     return -1;
 }
 
+/* Paint a gs×gs block of pixels for one font dot. */
+static void draw_font_pixel(uint32_t *pixels, uint32_t cw, uint32_t ch,
+                             int32_t rx, int32_t ry, int32_t gs, uint32_t color)
+{
+    for (int32_t bry = 0; bry < gs; bry++) {
+        int32_t row = ry + bry;
+        if (row < 0 || row >= (int32_t)ch) {
+            continue;
+        }
+        for (int32_t brx = 0; brx < gs; brx++) {
+            int32_t col = rx + brx;
+            if (col < 0 || col >= (int32_t)cw) {
+                continue;
+            }
+            pixels[((size_t)row * (size_t)cw) + (size_t)col] = color;
+        }
+    }
+}
+
 /* Draw the hex label centred at the bottom of the preview square.
- * Each font pixel is a 2×2 block for legibility at PREVIEW_SIZE=100.  */
+ * preview_px: physical PREVIEW_SIZE. bar_h_px: physical bar height.
+ * gs: font block size in physical pixels (≥1).                        */
 static void draw_label(Output *out, uint32_t *pixels,
-                       int32_t sq_x, int32_t sq_y, uint32_t text_color)
+                       int32_t sq_x, int32_t sq_y,
+                       int32_t preview_px, int32_t bar_h_px, int32_t gs,
+                       uint32_t text_color)
 {
     App     *app = out->app;
-    uint32_t ow  = out->ov_width;
-    uint32_t oh  = out->ov_height;
-    /* 7 glyphs × 10px + 6 gaps × 2px = 82px total label width.          */
-    int32_t x0 = sq_x + (int32_t)((PREVIEW_SIZE - 82) / 2);
-    /* 7 rows × 2px = 14px glyph height; centre vertically in the 20px bar.
-     * bar top = PREVIEW_SIZE-20; (20-14)/2 = 3px padding → PREVIEW_SIZE-17. */
-    int32_t y0 = sq_y + (int32_t)(PREVIEW_SIZE - 17);
+    uint32_t cw  = out->cap_width;
+    uint32_t ch  = out->cap_height;
+
+    /* label_w = 7 glyphs × (5+1) font-dots × gs, minus the trailing gap. */
+    int32_t label_w = 41 * gs;
+    int32_t x0      = sq_x + ((preview_px - label_w) / 2);
+    /* Centre label vertically in the bar. */
+    int32_t y0 = sq_y + (preview_px - ((bar_h_px + (7 * gs)) / 2));
 
     if (y0 < 0) {
         return;
@@ -299,7 +331,7 @@ static void draw_label(Output *out, uint32_t *pixels,
         if (gi < 0) {
             continue;
         }
-        int32_t gx0 = x0 + (int32_t)(ci * 12); /* 10px glyph + 2px gap */
+        int32_t gx0 = x0 + (int32_t)(ci * 6 * gs);
 
         for (int gy = 0; gy < 7; gy++) {
             uint8_t rb = font5x7[gi][gy];
@@ -307,128 +339,113 @@ static void draw_label(Output *out, uint32_t *pixels,
                 if (((unsigned)rb & (1U << (unsigned)(4 - gx))) == 0U) {
                     continue;
                 }
-                int32_t rx = gx0 + (int32_t)(gx * 2);
-                int32_t ry = y0  + (int32_t)(gy * 2);
-                if (rx < 0 || ry < 0 ||
-                    rx + 1 >= (int32_t)ow || ry + 1 >= (int32_t)oh) {
-                    continue;
-                }
-                size_t base = ((size_t)ry * (size_t)ow) + (size_t)rx;
-                pixels[base]                   = text_color;
-                pixels[base + 1U]              = text_color;
-                pixels[base + (size_t)ow]      = text_color;
-                pixels[base + (size_t)ow + 1U] = text_color;
+                draw_font_pixel(pixels, cw, ch,
+                                gx0 + (int32_t)(gx * gs),
+                                y0  + (int32_t)(gy * gs),
+                                gs, text_color);
             }
         }
     }
 }
 
-/* Fill a solid rectangle of height `bar_h` at the bottom of the preview
- * square.  Used as the background behind the hex label.              */
+/* Fill a solid rectangle of height bar_h at the bottom of the preview square. */
 static void draw_color_bar(Output *out, uint32_t *pixels,
                            int32_t sq_x, int32_t sq_y,
-                           int32_t bar_h, uint32_t color)
+                           int32_t bar_h, int32_t preview_px, uint32_t color)
 {
-    uint32_t ow = out->ov_width;
-    uint32_t oh = out->ov_height;
-    int32_t  y0 = sq_y + (int32_t)PREVIEW_SIZE - bar_h;
+    uint32_t cw = out->cap_width;
+    uint32_t ch = out->cap_height;
+    int32_t  y0 = sq_y + preview_px - bar_h;
     for (int32_t dy = 0; dy < bar_h; dy++) {
         int32_t row = y0 + dy;
-        if (row < 0 || row >= (int32_t)oh) {
+        if (row < 0 || row >= (int32_t)ch) {
             continue;
         }
-        for (int32_t dx = 0; dx < PREVIEW_SIZE; dx++) {
+        for (int32_t dx = 0; dx < preview_px; dx++) {
             int32_t col = sq_x + dx;
-            if (col >= 0 && col < (int32_t)ow) {
-                pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
+            if (col >= 0 && col < (int32_t)cw) {
+                pixels[((size_t)row * (size_t)cw) + (size_t)col] = color;
             }
         }
     }
 }
 
-/* Draw a 1-pixel border around the zoomed block that corresponds to the
- * sampled (hotspot) pixel.  Block size = zoom × zoom; its top-left corner
- * in the preview is at (CURSOR_HOT × zoom, CURSOR_HOT × zoom).           */
+/* Draw a 1-pixel border around the hotspot block.
+ * zoom: physical pixels per source pixel. hot_px: physical hotspot offset. */
 static void draw_sample_marker(Output *out, uint32_t *pixels,
-                               int32_t sq_x, int32_t sq_y, uint32_t color)
+                               int32_t sq_x, int32_t sq_y,
+                               int32_t zoom, int32_t hot_px, uint32_t color)
 {
-    uint32_t ow   = out->ov_width;
-    uint32_t oh   = out->ov_height;
-    int32_t  zoom = PREVIEW_SIZE / CURSOR_SIZE;
-    int32_t  bx0  = sq_x + (CURSOR_HOT * zoom);
-    int32_t  by0  = sq_y + (CURSOR_HOT * zoom);
+    uint32_t cw  = out->cap_width;
+    uint32_t ch  = out->cap_height;
+    int32_t  bx0 = sq_x + (hot_px * zoom);
+    int32_t  by0 = sq_y + (hot_px * zoom);
 
     for (int32_t di = -1; di <= zoom; di++) {
-        /* Top and bottom edges. */
         for (int32_t edge = -1; edge <= zoom; edge += (zoom + 1)) {
             int32_t row = by0 + edge;
             int32_t col = bx0 + di;
-            if (row >= 0 && row < (int32_t)oh && col >= 0 && col < (int32_t)ow) {
-                pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
+            if (row >= 0 && row < (int32_t)ch && col >= 0 && col < (int32_t)cw) {
+                pixels[((size_t)row * (size_t)cw) + (size_t)col] = color;
             }
         }
-        /* Left and right edges. */
         for (int32_t edge = -1; edge <= zoom; edge += (zoom + 1)) {
             int32_t row = by0 + di;
             int32_t col = bx0 + edge;
-            if (row >= 0 && row < (int32_t)oh && col >= 0 && col < (int32_t)ow) {
-                pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
+            if (row >= 0 && row < (int32_t)ch && col >= 0 && col < (int32_t)cw) {
+                pixels[((size_t)row * (size_t)cw) + (size_t)col] = color;
             }
         }
     }
 }
 
-/* Draw a 1-pixel border around the preview square in the given color. */
+/* Draw a 1-pixel border around the preview square. preview_px: physical size. */
 static void draw_border(Output *out, uint32_t *pixels,
-                        int32_t sq_x, int32_t sq_y, uint32_t border_color)
+                        int32_t sq_x, int32_t sq_y, int32_t preview_px,
+                        uint32_t border_color)
 {
-    uint32_t ow = out->ov_width;
-    uint32_t oh = out->ov_height;
+    uint32_t cw = out->cap_width;
+    uint32_t ch = out->cap_height;
 
-    for (int32_t di = -1; di <= PREVIEW_SIZE; di++) {
-        /* Top and bottom edges. */
-        for (int32_t edge = -1; edge <= PREVIEW_SIZE; edge += (PREVIEW_SIZE + 1)) {
+    for (int32_t di = -1; di <= preview_px; di++) {
+        for (int32_t edge = -1; edge <= preview_px; edge += (preview_px + 1)) {
             int32_t row = sq_y + edge;
             int32_t col = sq_x + di;
-            if (row >= 0 && row < (int32_t)oh && col >= 0 && col < (int32_t)ow) {
-                pixels[((size_t)row * (size_t)ow) + (size_t)col] = border_color;
+            if (row >= 0 && row < (int32_t)ch && col >= 0 && col < (int32_t)cw) {
+                pixels[((size_t)row * (size_t)cw) + (size_t)col] = border_color;
             }
         }
-        /* Left and right edges. */
-        for (int32_t edge = -1; edge <= PREVIEW_SIZE; edge += (PREVIEW_SIZE + 1)) {
+        for (int32_t edge = -1; edge <= preview_px; edge += (preview_px + 1)) {
             int32_t row = sq_y + di;
             int32_t col = sq_x + edge;
-            if (row >= 0 && row < (int32_t)oh && col >= 0 && col < (int32_t)ow) {
-                pixels[((size_t)row * (size_t)ow) + (size_t)col] = border_color;
+            if (row >= 0 && row < (int32_t)ch && col >= 0 && col < (int32_t)cw) {
+                pixels[((size_t)row * (size_t)cw) + (size_t)col] = border_color;
             }
         }
     }
 }
 
-/* Fill the overlay buffer with a scaled copy of the captured screen pixels.
- * Falls back to opaque black if no capture is available yet.               */
-/* Copy a rectangle of captured screen pixels (in logical coordinates) into the
- * overlay buffer.  Coordinates are clamped to the surface bounds internally.  */
+/* Copy a rectangle of captured screen pixels (in physical coordinates) into
+ * the overlay buffer.  Both buffers are at physical resolution so no scaling
+ * is needed — coordinates are clamped to the capture bounds internally.    */
 static void blit_capture_rect(Output *out, uint32_t *pixels,
                                int32_t rx, int32_t ry,
                                int32_t rw, int32_t rh)
 {
-    uint32_t ow = out->ov_width;
-    uint32_t oh = out->ov_height;
+    uint32_t cw = out->cap_width;
+    uint32_t ch = out->cap_height;
     int32_t  x0 = (rx < 0) ? 0 : rx;
     int32_t  y0 = (ry < 0) ? 0 : ry;
-    int32_t  x1 = ((rx + rw) > (int32_t)ow) ? (int32_t)ow : (rx + rw);
-    int32_t  y1 = ((ry + rh) > (int32_t)oh) ? (int32_t)oh : (ry + rh);
+    int32_t  x1 = ((rx + rw) > (int32_t)cw) ? (int32_t)cw : (rx + rw);
+    int32_t  y1 = ((ry + rh) > (int32_t)ch) ? (int32_t)ch : (ry + rh);
 
     for (int32_t row = y0; row < y1; row++) {
-        size_t phys_y = ((size_t)row * (size_t)out->cap_height) / (size_t)oh;
         for (int32_t col = x0; col < x1; col++) {
-            size_t  phys_x = ((size_t)col * (size_t)out->cap_width) / (size_t)ow;
-            size_t  off    = ((phys_y * (size_t)out->cap_width) + phys_x) * 4U;
-            uint8_t cb     = out->pixels[off + 0U];
-            uint8_t cg     = out->pixels[off + 1U];
-            uint8_t cr     = out->pixels[off + 2U];
-            pixels[((size_t)row * (size_t)ow) + (size_t)col] =
+            size_t  off = (((size_t)row * (size_t)cw) + (size_t)col) * 4U;
+            uint8_t cb  = out->pixels[off + 0U];
+            uint8_t cg  = out->pixels[off + 1U];
+            uint8_t cr  = out->pixels[off + 2U];
+            pixels[((size_t)row * (size_t)cw) + (size_t)col] =
                 (0xFFU << 24U) | ((uint32_t)cr << 16U) |
                 ((uint32_t)cg <<  8U) | (uint32_t)cb;
         }
@@ -442,15 +459,16 @@ static void update_damage_rect(Output *out,
                                 int32_t px, int32_t py,
                                 int32_t old_px, int32_t old_py)
 {
+    int32_t pp  = out->preview_px;
     int32_t dx0 = px - 1;
     int32_t dy0 = py - 1;
-    int32_t dx1 = px + (int32_t)PREVIEW_SIZE + 1;
-    int32_t dy1 = py + (int32_t)PREVIEW_SIZE + 1;
+    int32_t dx1 = px + pp + 1;
+    int32_t dy1 = py + pp + 1;
     if (old_px != INT32_MIN) {
         if ((old_px - 1) < dx0) { dx0 = old_px - 1; }
         if ((old_py - 1) < dy0) { dy0 = old_py - 1; }
-        if ((old_px + (int32_t)PREVIEW_SIZE + 1) > dx1) { dx1 = old_px + (int32_t)PREVIEW_SIZE + 1; }
-        if ((old_py + (int32_t)PREVIEW_SIZE + 1) > dy1) { dy1 = old_py + (int32_t)PREVIEW_SIZE + 1; }
+        if ((old_px + pp + 1) > dx1) { dx1 = old_px + pp + 1; }
+        if ((old_py + pp + 1) > dy1) { dy1 = old_py + pp + 1; }
     }
     out->damage_x = dx0;
     out->damage_y = dy0;
@@ -466,66 +484,70 @@ static void draw_overlay(Output *out)
         return;
     }
 
-    App     *app = out->app;
-    uint32_t ow  = out->ov_width;
-    uint32_t oh  = out->ov_height;
+    App     *app  = out->app;
+    uint32_t cw   = out->cap_width;
+    uint32_t ch   = out->cap_height;
+    int32_t  pp   = out->preview_px;
+    int32_t  gs   = out->glyph_scale;
 
-    /* Restore only the region this buffer previously had a preview square in,
-     * rather than repainting the entire background on every mouse move.     */
+    /* Scale pointer logical coords to physical buffer coords. */
+    int32_t ptr_x = (int32_t)(((size_t)app->pointer_x * (size_t)cw) / (size_t)out->log_width);
+    int32_t ptr_y = (int32_t)(((size_t)app->pointer_y * (size_t)ch) / (size_t)out->log_height);
+
+    /* Physical equivalents of the cursor size constants. */
+    int32_t cursor_px = (int32_t)(((size_t)CURSOR_SIZE * (size_t)cw) / (size_t)out->log_width);
+    int32_t hot_px    = (int32_t)(((size_t)CURSOR_HOT  * (size_t)cw) / (size_t)out->log_width);
+    if (cursor_px < 1) { cursor_px = 1; }
+    if (hot_px    < 1) { hot_px    = 1; }
+
+    /* Repair this buffer's previous dirty region before drawing the new one. */
     int32_t old_px = out->prev_px[bi];
     int32_t old_py = out->prev_py[bi];
     if (old_px != INT32_MIN) {
-        blit_capture_rect(out, pixels,
-                          old_px - 1, old_py - 1,
-                          (int32_t)PREVIEW_SIZE + 2, (int32_t)PREVIEW_SIZE + 2);
+        blit_capture_rect(out, pixels, old_px - 1, old_py - 1, pp + 2, pp + 2);
     }
 
-    /* Position the preview square (prefer right+below; clamp to edge). */
-    int32_t px = app->pointer_x + (int32_t)CURSOR_SIZE + 4;
-    int32_t py = app->pointer_y + (int32_t)CURSOR_SIZE + 4;
-    if (px + (int32_t)PREVIEW_SIZE > (int32_t)ow) {
-        px = app->pointer_x - (int32_t)PREVIEW_SIZE - 4;
-    }
-    if (py + (int32_t)PREVIEW_SIZE > (int32_t)oh) {
-        py = app->pointer_y - (int32_t)PREVIEW_SIZE - 4;
-    }
+    /* Position preview square (prefer right+below; clamp to physical edge). */
+    int32_t gap = (int32_t)(((size_t)4U * (size_t)cw) / (size_t)out->log_width);
+    int32_t px  = ptr_x + cursor_px + gap;
+    int32_t py  = ptr_y + cursor_px + gap;
+    if (px + pp > (int32_t)cw) { px = ptr_x - pp - gap; }
+    if (py + pp > (int32_t)ch) { py = ptr_y - pp - gap; }
 
-    /* Zoom CURSOR_SIZE×CURSOR_SIZE pick region to PREVIEW_SIZE×PREVIEW_SIZE.
-     * Each source pixel maps to a zoom×zoom block; region centered on hotspot. */
-    int32_t zoom         = (int32_t)PREVIEW_SIZE / (int32_t)CURSOR_SIZE;
-    int32_t src_origin_x = app->pointer_x - (int32_t)CURSOR_HOT;
-    int32_t src_origin_y = app->pointer_y - (int32_t)CURSOR_HOT;
+    /* Zoom cursor_px×cursor_px source region to pp×pp in the preview.
+     * Source and destination are both in physical pixel coordinates.   */
+    int32_t zoom         = pp / cursor_px;
+    int32_t src_origin_x = ptr_x - hot_px;
+    int32_t src_origin_y = ptr_y - hot_px;
 
-    for (int32_t dy = 0; dy < (int32_t)PREVIEW_SIZE; dy++) {
+    for (int32_t dy = 0; dy < pp; dy++) {
         int32_t row = py + dy;
-        if (row < 0 || row >= (int32_t)oh) {
+        if (row < 0 || row >= (int32_t)ch) {
             continue;
         }
-        int32_t src_ly = src_origin_y + (dy / zoom);
+        int32_t src_py = src_origin_y + (dy / zoom);
 
-        for (int32_t dx = 0; dx < (int32_t)PREVIEW_SIZE; dx++) {
+        for (int32_t dx = 0; dx < pp; dx++) {
             int32_t col = px + dx;
-            if (col < 0 || col >= (int32_t)ow) {
+            if (col < 0 || col >= (int32_t)cw) {
                 continue;
             }
-            int32_t src_lx = src_origin_x + (dx / zoom);
+            int32_t src_px = src_origin_x + (dx / zoom);
 
             uint32_t color;
             if (!out->pixels ||
-                src_lx < 0 || src_ly < 0 ||
-                (uint32_t)src_lx >= ow || (uint32_t)src_ly >= oh) {
-                color = 0xFF000000U; /* out-of-bounds: opaque black */
+                src_px < 0 || src_py < 0 ||
+                (uint32_t)src_px >= cw || (uint32_t)src_py >= ch) {
+                color = 0xFF000000U;
             } else {
-                size_t phys_x = ((size_t)src_lx * (size_t)out->cap_width)  / (size_t)ow;
-                size_t phys_y = ((size_t)src_ly * (size_t)out->cap_height) / (size_t)oh;
-                size_t offset = (((phys_y * (size_t)out->cap_width) + phys_x) * 4U);
-                uint8_t cb    = out->pixels[offset + 0U];
-                uint8_t cg    = out->pixels[offset + 1U];
-                uint8_t cr    = out->pixels[offset + 2U];
+                size_t  off = (((size_t)src_py * (size_t)cw) + (size_t)src_px) * 4U;
+                uint8_t cb  = out->pixels[off + 0U];
+                uint8_t cg  = out->pixels[off + 1U];
+                uint8_t cr  = out->pixels[off + 2U];
                 color = (0xFFU << 24U) | ((uint32_t)cr << 16U) |
                         ((uint32_t)cg << 8U) | (uint32_t)cb;
             }
-            pixels[((size_t)row * (size_t)ow) + (size_t)col] = color;
+            pixels[((size_t)row * (size_t)cw) + (size_t)col] = color;
         }
     }
 
@@ -533,16 +555,17 @@ static void draw_overlay(Output *out)
     uint32_t tg = (app->current_color >>  8U) & 0xFFU;
     uint32_t tb =  app->current_color          & 0xFFU;
     uint32_t bar_color = (0xFFU << 24U) | (tr << 16U) | (tg << 8U) | tb;
-    draw_color_bar(out, pixels, px, py, 20, bar_color);
+    int32_t  bar_h_px  = (int32_t)(((size_t)20U * (size_t)cw) / (size_t)out->log_width);
+    if (bar_h_px < gs) { bar_h_px = gs; }
+    draw_color_bar(out, pixels, px, py, bar_h_px, pp, bar_color);
 
     uint32_t luma       = ((tr * 299U) + (tg * 587U)) + (tb * 114U);
     uint32_t text_color = (luma > 127500U) ? 0xFF000000U : 0xFFFFFFFFU;
 
-    draw_border(out, pixels, px, py, text_color);
-    draw_sample_marker(out, pixels, px, py, text_color);
-    draw_label(out, pixels, px, py, text_color);
+    draw_border(out, pixels, px, py, pp, text_color);
+    draw_sample_marker(out, pixels, px, py, zoom, hot_px, text_color);
+    draw_label(out, pixels, px, py, pp, bar_h_px, gs, text_color);
 
-    /* Record dirty region for next repair and compute partial damage rect. */
     out->prev_px[bi] = px;
     out->prev_py[bi] = py;
     update_damage_rect(out, px, py, old_px, old_py);
@@ -600,17 +623,15 @@ static void sample_color(App *app)
     int32_t px = app->pointer_x;
     int32_t py = app->pointer_y;
 
-    /* Pointer coordinates are in logical (surface-local) pixels.
-     * The capture buffer is at physical pixel resolution.
-     * Scale using the cap/overlay ratio to handle HiDPI outputs.        */
+    /* Bounds check in logical coords; scale to physical for the capture lookup. */
     if (px < 0 || py < 0 ||
-        (uint32_t)px >= out->ov_width ||
-        (uint32_t)py >= out->ov_height) {
+        (uint32_t)px >= out->log_width ||
+        (uint32_t)py >= out->log_height) {
         return;
     }
 
-    size_t phys_x = ((size_t)px * (size_t)out->cap_width)  / (size_t)out->ov_width;
-    size_t phys_y = ((size_t)py * (size_t)out->cap_height) / (size_t)out->ov_height;
+    size_t phys_x = ((size_t)px * (size_t)out->cap_width)  / (size_t)out->log_width;
+    size_t phys_y = ((size_t)py * (size_t)out->cap_height) / (size_t)out->log_height;
 
     size_t offset = ((phys_y * (size_t)out->cap_width) + phys_x) * 4U;
     uint8_t cb = out->pixels[offset + 0U];
@@ -677,24 +698,32 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
             !out->ov_pixels[out->ov_back]) {
             continue;
         }
-        int     bi  = out->ov_back;
-        int32_t opx = out->prev_px[bi];
-        int32_t opy = out->prev_py[bi];
-        if (opx == INT32_MIN) {
-            break; /* buffer already clean, nothing to erase */
+        int bi = out->ov_back;
+
+        /* If both buffers are clean there is no preview to erase.          */
+        if (out->prev_px[bi] == INT32_MIN && out->prev_px[bi ^ 1] == INT32_MIN) {
+            break;
         }
+
+        /* Repair the back buffer's own dirty region if it has one.
+         * If the back buffer is clean but the front buffer is dirty, the
+         * back buffer already holds correct screenshot pixels everywhere —
+         * commit it as-is to replace the stale front buffer.              */
+        if (out->prev_px[bi] != INT32_MIN) {
+            blit_capture_rect(out, out->ov_pixels[bi],
+                              out->prev_px[bi] - 1, out->prev_py[bi] - 1,
+                              out->preview_px + 2, out->preview_px + 2);
+            out->prev_px[bi] = INT32_MIN;
+            out->prev_py[bi] = INT32_MIN;
+        }
+
         out->ov_busy[bi] = 1;
         out->ov_back     = bi ^ 1;
-        blit_capture_rect(out, out->ov_pixels[bi],
-                          opx - 1, opy - 1,
-                          (int32_t)PREVIEW_SIZE + 2, (int32_t)PREVIEW_SIZE + 2);
-        out->prev_px[bi] = INT32_MIN;
-        out->prev_py[bi] = INT32_MIN;
         wl_surface_attach(out->overlay_surface, out->ov_buf[bi], 0, 0);
-        wl_surface_damage_buffer(out->overlay_surface,
-                                 opx - 1, opy - 1,
-                                 (int32_t)PREVIEW_SIZE + 2,
-                                 (int32_t)PREVIEW_SIZE + 2);
+        /* Full-surface damage: the front buffer may have had a preview at a
+         * different position than the back buffer, and both must be cleared. */
+        wl_surface_damage_buffer(out->overlay_surface, 0, 0,
+                                 (int32_t)out->cap_width, (int32_t)out->cap_height);
         wl_surface_commit(out->overlay_surface);
         wl_display_flush(app->display);
         break;
@@ -924,14 +953,31 @@ static void layer_surface_configure(void *data,
         return; /* already configured */
     }
 
-    out->ov_width  = width  ? width  : out->cap_width;
-    out->ov_height = height ? height : out->cap_height;
+    /* Store logical surface dimensions; create overlay buffers at physical size. */
+    out->log_width  = width  ? width  : out->cap_width;
+    out->log_height = height ? height : out->cap_height;
+    out->ov_width   = out->cap_width;
+    out->ov_height  = out->cap_height;
 
-    /* Allocate two overlay buffers for double-buffering. */
-    out->ov_pixels_size = ((size_t)out->ov_width * (size_t)out->ov_height) * 4U;
+    /* Compute physical equivalents of the logical UI size constants. */
+    out->preview_px  = (int32_t)(((size_t)PREVIEW_SIZE * (size_t)out->cap_width) /
+                                  (size_t)out->log_width);
+    out->glyph_scale = (int32_t)((2U * out->cap_width) / out->log_width);
+    if (out->preview_px  < 1) { out->preview_px  = (int32_t)PREVIEW_SIZE; }
+    if (out->glyph_scale < 1) { out->glyph_scale = 1; }
+
+    /* Tell the compositor to map the physical buffer to the logical surface. */
+    if (out->viewport) {
+        wp_viewport_set_destination(out->viewport,
+                                    (int32_t)out->log_width,
+                                    (int32_t)out->log_height);
+    }
+
+    /* Allocate two overlay buffers at physical resolution for double-buffering. */
+    out->ov_pixels_size = ((size_t)out->cap_width * (size_t)out->cap_height) * 4U;
     for (int bi = 0; bi < 2; bi++) {
         out->ov_pixels[bi] = create_shm_buffer(app->shm,
-                                               out->ov_width, out->ov_height,
+                                               out->cap_width, out->cap_height,
                                                &out->ov_buf[bi]);
         if (!out->ov_pixels[bi]) {
             fprintf(stderr, "Failed to allocate overlay buffer\n");
@@ -947,7 +993,7 @@ static void layer_surface_configure(void *data,
     for (int bi = 0; bi < 2; bi++) {
         blit_capture_rect(out, out->ov_pixels[bi],
                           0, 0,
-                          (int32_t)out->ov_width, (int32_t)out->ov_height);
+                          (int32_t)out->cap_width, (int32_t)out->cap_height);
         out->prev_px[bi] = INT32_MIN;
         out->prev_py[bi] = INT32_MIN;
     }
@@ -979,7 +1025,7 @@ static void layer_surface_configure(void *data,
     out->ov_back = ini_b ^ 1;
     wl_surface_attach(out->overlay_surface, out->ov_buf[ini_b], 0, 0);
     wl_surface_damage_buffer(out->overlay_surface, 0, 0,
-                             (int32_t)out->ov_width, (int32_t)out->ov_height);
+                             (int32_t)out->cap_width, (int32_t)out->cap_height);
     wl_surface_commit(out->overlay_surface);
 
     app->overlays_configured++;
@@ -1019,6 +1065,11 @@ static void start_pick_phase(App *app)
         Output *out = &app->outputs[i];
 
         out->overlay_surface = wl_compositor_create_surface(app->compositor);
+
+        if (app->viewporter) {
+            out->viewport = wp_viewporter_get_viewport(app->viewporter,
+                                                       out->overlay_surface);
+        }
 
         out->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
             app->layer_shell,
@@ -1317,6 +1368,9 @@ static void registry_global(void *data, struct wl_registry *registry,
     } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         app->layer_shell = wl_registry_bind(registry, name,
                                              &zwlr_layer_shell_v1_interface, 4);
+    } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
+        app->viewporter = wl_registry_bind(registry, name,
+                                            &wp_viewporter_interface, 1);
     }
 }
 
@@ -1434,6 +1488,9 @@ int main(void)
     /* ── Cleanup ─────────────────────────────────────────────────────────*/
     for (int i = 0; i < app.output_count; i++) {
         Output *out = &app.outputs[i];
+        if (out->viewport) {
+            wp_viewport_destroy(out->viewport);
+        }
         for (int bi = 0; bi < 2; bi++) {
             if (out->ov_pixels[bi]) {
                 munmap(out->ov_pixels[bi], out->ov_pixels_size);
@@ -1445,6 +1502,9 @@ int main(void)
     }
     if (app.cursor_pixels) {
         munmap(app.cursor_pixels, app.cursor_pixels_size);
+    }
+    if (app.viewporter) {
+        wp_viewporter_destroy(app.viewporter);
     }
 
     wl_display_disconnect(app.display);

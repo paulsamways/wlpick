@@ -26,6 +26,7 @@ protocols = [
   'ext-image-capture-source-v1',
   'ext-image-copy-capture-v1',
   'wlr-layer-shell-unstable-v1',
+  'viewporter',
 ]
 
 protocol_sources = []

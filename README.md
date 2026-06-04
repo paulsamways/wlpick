@@ -71,6 +71,7 @@ On left-click, the color string is offered via `wl_data_source` / `wl_data_devic
 | `zwlr_layer_shell_v1` | wlr-protocols (vendored) | Fullscreen transparent overlay above all windows |
 | `ext_output_image_capture_source_manager_v1` | wayland-protocols staging (vendored) | Creates a capture source from an output |
 | `ext_image_copy_capture_manager_v1` | wayland-protocols staging (vendored) | Copies output pixels into a shared-memory buffer |
+| `wp_viewporter` | wayland-protocols stable (vendored) | Maps the physical-resolution overlay buffer to the logical surface size, preventing blur on outputs with fractional scale factors (e.g. 1.25×) |
 
 Protocol XML files are vendored under `protocol/`. C bindings are generated at build time by `wayland-scanner`.
 
@@ -84,6 +85,7 @@ The files and their upstream sources:
 | `protocol/ext-image-copy-capture-v1.xml` | [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols) — `staging/ext-image-copy-capture/` | Staging protocol; not yet in most distro packages |
 | `protocol/wlr-layer-shell-unstable-v1.xml` | [wlr-protocols](https://gitlab.freedesktop.org/wlroots/wlr-protocols) — `unstable/` | wlroots-specific; not part of the Wayland standard |
 | `protocol/xdg-shell.xml` | [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols) — `stable/xdg-shell/` | Not used directly by the app, but `wlr-layer-shell` references `xdg_popup_interface` internally, so the generated code requires it at link time |
+| `protocol/viewporter.xml` | [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols) — `stable/viewporter/` | Stable protocol; available on all modern Wayland compositors |
 
 If you need to update a protocol, replace the relevant file in `protocol/` with the new version from upstream and rebuild.
 

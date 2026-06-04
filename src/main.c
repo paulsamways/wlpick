@@ -16,6 +16,7 @@
 
 /* _GNU_SOURCE is set via the compiler command line (-D_GNU_SOURCE). */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -96,6 +97,7 @@ static int shm_alloc(size_t size)
  * Returns the mmap'd pointer (must be munmap'd by the caller) or NULL.  */
 static void *create_shm_buffer(struct wl_shm *shm,
                                uint32_t width, uint32_t height,
+                               uint32_t format,
                                struct wl_buffer **buf_out)
 {
     size_t stride = (size_t)width * 4U;
@@ -119,7 +121,7 @@ static void *create_shm_buffer(struct wl_shm *shm,
     *buf_out = wl_shm_pool_create_buffer(pool, 0,
                                           (int32_t)width, (int32_t)height,
                                           (int32_t)stride,
-                                          WL_SHM_FORMAT_ARGB8888);
+                                          format);
     wl_shm_pool_destroy(pool);
 
     return data;
@@ -140,7 +142,9 @@ typedef struct {
     struct ext_image_copy_capture_frame_v1   *capture_frame;
     uint32_t  cap_width;
     uint32_t  cap_height;
-    uint8_t  *pixels;               /* ARGB8888 captured screen pixels    */
+    uint32_t  cap_format;           /* SHM pixel format from shm_format event */
+    int       cap_format_set;       /* nonzero once cap_format is confirmed   */
+    uint8_t  *pixels;               /* captured screen pixels (cap_format)    */
     size_t    pixels_size;
     struct wl_buffer *capture_buf;
 
@@ -370,28 +374,25 @@ static void draw_color_bar(Output *out, uint32_t *pixels,
     }
 }
 
-/* Draw a 1-pixel border around the hotspot block.
- * zoom: physical pixels per source pixel. hot_px: physical hotspot offset. */
-static void draw_sample_marker(Output *out, uint32_t *pixels,
-                               int32_t sq_x, int32_t sq_y,
-                               int32_t zoom, int32_t hot_px, uint32_t color)
+/* Draw a 1-pixel hollow rectangle of the given size starting at (x0, y0). */
+static void draw_hollow_rect(Output *out, uint32_t *pixels,
+                              int32_t x0, int32_t y0, int32_t size,
+                              uint32_t color)
 {
-    uint32_t cw  = out->cap_width;
-    uint32_t ch  = out->cap_height;
-    int32_t  bx0 = sq_x + (hot_px * zoom);
-    int32_t  by0 = sq_y + (hot_px * zoom);
+    uint32_t cw = out->cap_width;
+    uint32_t ch = out->cap_height;
 
-    for (int32_t di = -1; di <= zoom; di++) {
-        for (int32_t edge = -1; edge <= zoom; edge += (zoom + 1)) {
-            int32_t row = by0 + edge;
-            int32_t col = bx0 + di;
+    for (int32_t di = -1; di <= size; di++) {
+        for (int32_t edge = -1; edge <= size; edge += (size + 1)) {
+            int32_t row = y0 + edge;
+            int32_t col = x0 + di;
             if (row >= 0 && row < (int32_t)ch && col >= 0 && col < (int32_t)cw) {
                 pixels[((size_t)row * (size_t)cw) + (size_t)col] = color;
             }
         }
-        for (int32_t edge = -1; edge <= zoom; edge += (zoom + 1)) {
-            int32_t row = by0 + di;
-            int32_t col = bx0 + edge;
+        for (int32_t edge = -1; edge <= size; edge += (size + 1)) {
+            int32_t row = y0 + di;
+            int32_t col = x0 + edge;
             if (row >= 0 && row < (int32_t)ch && col >= 0 && col < (int32_t)cw) {
                 pixels[((size_t)row * (size_t)cw) + (size_t)col] = color;
             }
@@ -399,30 +400,23 @@ static void draw_sample_marker(Output *out, uint32_t *pixels,
     }
 }
 
+/* Draw a 1-pixel border around the hotspot block.
+ * zoom: physical pixels per source pixel. hot_px: physical hotspot offset. */
+static void draw_sample_marker(Output *out, uint32_t *pixels,
+                               int32_t sq_x, int32_t sq_y,
+                               int32_t zoom, int32_t hot_px, uint32_t color)
+{
+    draw_hollow_rect(out, pixels,
+                     sq_x + (hot_px * zoom), sq_y + (hot_px * zoom),
+                     zoom, color);
+}
+
 /* Draw a 1-pixel border around the preview square. preview_px: physical size. */
 static void draw_border(Output *out, uint32_t *pixels,
                         int32_t sq_x, int32_t sq_y, int32_t preview_px,
                         uint32_t border_color)
 {
-    uint32_t cw = out->cap_width;
-    uint32_t ch = out->cap_height;
-
-    for (int32_t di = -1; di <= preview_px; di++) {
-        for (int32_t edge = -1; edge <= preview_px; edge += (preview_px + 1)) {
-            int32_t row = sq_y + edge;
-            int32_t col = sq_x + di;
-            if (row >= 0 && row < (int32_t)ch && col >= 0 && col < (int32_t)cw) {
-                pixels[((size_t)row * (size_t)cw) + (size_t)col] = border_color;
-            }
-        }
-        for (int32_t edge = -1; edge <= preview_px; edge += (preview_px + 1)) {
-            int32_t row = sq_y + di;
-            int32_t col = sq_x + edge;
-            if (row >= 0 && row < (int32_t)ch && col >= 0 && col < (int32_t)cw) {
-                pixels[((size_t)row * (size_t)cw) + (size_t)col] = border_color;
-            }
-        }
-    }
+    draw_hollow_rect(out, pixels, sq_x, sq_y, preview_px, border_color);
 }
 
 /* Copy a rectangle of captured screen pixels (in physical coordinates) into
@@ -474,6 +468,13 @@ static void update_damage_rect(Output *out,
     out->damage_y = dy0;
     out->damage_w = dx1 - dx0;
     out->damage_h = dy1 - dy0;
+}
+
+/* Return black or white, whichever contrasts better with the given colour. */
+static inline uint32_t contrast_color(uint32_t r, uint32_t g, uint32_t b)
+{
+    uint32_t luma = (r * 299U) + (g * 587U) + (b * 114U);
+    return (luma > 127500U) ? 0xFF000000U : 0xFFFFFFFFU;
 }
 
 static void draw_overlay(Output *out)
@@ -559,8 +560,7 @@ static void draw_overlay(Output *out)
     if (bar_h_px < gs) { bar_h_px = gs; }
     draw_color_bar(out, pixels, px, py, bar_h_px, pp, bar_color);
 
-    uint32_t luma       = ((tr * 299U) + (tg * 587U)) + (tb * 114U);
-    uint32_t text_color = (luma > 127500U) ? 0xFF000000U : 0xFFFFFFFFU;
+    uint32_t text_color = contrast_color(tr, tg, tb);
 
     draw_border(out, pixels, px, py, pp, text_color);
     draw_sample_marker(out, pixels, px, py, zoom, hot_px, text_color);
@@ -617,8 +617,7 @@ static void update_cursor_color(App *app)
     uint32_t tr    = (app->current_color >> 16U) & 0xFFU;
     uint32_t tg    = (app->current_color >>  8U) & 0xFFU;
     uint32_t tb    =  app->current_color          & 0xFFU;
-    uint32_t luma  = ((tr * 299U) + (tg * 587U)) + (tb * 114U);
-    uint32_t color = (luma > 127500U) ? 0xFF000000U : 0xFFFFFFFFU;
+    uint32_t color = contrast_color(tr, tg, tb);
     draw_cursor(app, color);
     wl_surface_attach(app->cursor_surface, app->cursor_buf, 0, 0);
     wl_surface_damage_buffer(app->cursor_surface,
@@ -722,9 +721,19 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
             break;
         }
 
-        /* Repair the back buffer's own dirty region if it has one.
-         * If the back buffer is clean but the front buffer is dirty, the
-         * back buffer already holds correct screenshot pixels everywhere —
+        /* Pick a buffer we are allowed to write into.  Mirror commit_overlay's
+         * busy-check: never modify a buffer the compositor still holds.    */
+        if (out->ov_busy[bi]) {
+            int alt = bi ^ 1;
+            if (out->ov_busy[alt]) {
+                break; /* both held by compositor; release will arrive soon */
+            }
+            bi = alt;
+        }
+
+        /* Repair the chosen buffer's dirty region if it has one.
+         * If the buffer is clean but the front buffer is dirty, the
+         * buffer already holds correct screenshot pixels everywhere —
          * commit it as-is to replace the stale front buffer.              */
         if (out->prev_px[bi] != INT32_MIN) {
             blit_capture_rect(out, out->ov_pixels[bi],
@@ -996,6 +1005,7 @@ static void layer_surface_configure(void *data,
     for (int bi = 0; bi < 2; bi++) {
         out->ov_pixels[bi] = create_shm_buffer(app->shm,
                                                out->cap_width, out->cap_height,
+                                               WL_SHM_FORMAT_ARGB8888,
                                                &out->ov_buf[bi]);
         if (!out->ov_pixels[bi]) {
             fprintf(stderr, "Failed to allocate overlay buffer\n");
@@ -1023,6 +1033,7 @@ static void layer_surface_configure(void *data,
         app->cursor_pixels = create_shm_buffer(app->shm,
                                                (uint32_t)CURSOR_SIZE,
                                                (uint32_t)CURSOR_SIZE,
+                                               WL_SHM_FORMAT_ARGB8888,
                                                &app->cursor_buf);
         if (!app->cursor_pixels) {
             fprintf(stderr, "Failed to allocate cursor buffer\n");
@@ -1199,7 +1210,14 @@ static void capture_session_shm_format(void *data,
     struct ext_image_copy_capture_session_v1 *session,
     uint32_t format)
 {
-    (void)data; (void)session; (void)format;
+    (void)session;
+    Output *out = data;
+    /* Prefer ARGB8888 since blit_capture_rect and sample_color assume that
+     * byte layout; otherwise take the first advertised format.            */
+    if (!out->cap_format_set || format == WL_SHM_FORMAT_ARGB8888) {
+        out->cap_format = format;
+        out->cap_format_set = 1;
+    }
 }
 
 static void capture_session_dmabuf_device(void *data,
@@ -1235,6 +1253,7 @@ static void capture_session_done(void *data,
         out->pixels_size = ((size_t)out->cap_width * (size_t)out->cap_height) * 4U;
         out->pixels = create_shm_buffer(app->shm,
                                         out->cap_width, out->cap_height,
+                                        out->cap_format,
                                         &out->capture_buf);
         if (!out->pixels) {
             fprintf(stderr, "Failed to allocate screen capture buffer\n");
@@ -1298,9 +1317,17 @@ static void data_source_send(void *data, struct wl_data_source *source,
     (void)source; (void)mime_type;
     App *app = data;
 
-    size_t len = strlen(app->color_str);
-    ssize_t written = write(fd, app->color_str, len);
-    (void)written;
+    const char *buf = app->color_str;
+    size_t remaining = strlen(buf);
+    while (remaining > 0) {
+        ssize_t n = write(fd, buf, remaining);
+        if (n < 0) {
+            if (errno == EINTR) { continue; }
+            break;
+        }
+        buf       += (size_t)n;
+        remaining -= (size_t)n;
+    }
     close(fd);
 
     /* Data has been delivered to the requesting client; exit cleanly. */

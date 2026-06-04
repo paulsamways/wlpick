@@ -1212,10 +1212,16 @@ static void capture_session_shm_format(void *data,
 {
     (void)session;
     Output *out = data;
-    /* Prefer ARGB8888 since blit_capture_rect and sample_color assume that
-     * byte layout; otherwise take the first advertised format.            */
-    if (!out->cap_format_set || format == WL_SHM_FORMAT_ARGB8888) {
-        out->cap_format = format;
+    /* Only accept formats whose byte order (B=off+0, G=off+1, R=off+2) matches
+     * what blit_capture_rect and sample_color read.  ARGB8888 and XRGB8888
+     * share that layout and differ only in the alpha byte, which we ignore.
+     * Prefer ARGB8888; fall back to XRGB8888 if ARGB8888 is never advertised.
+     * Any other format is silently skipped — the default (ARGB8888) stands.  */
+    if (format == WL_SHM_FORMAT_ARGB8888) {
+        out->cap_format = WL_SHM_FORMAT_ARGB8888;
+        out->cap_format_set = 1;
+    } else if (format == WL_SHM_FORMAT_XRGB8888 && !out->cap_format_set) {
+        out->cap_format = WL_SHM_FORMAT_XRGB8888;
         out->cap_format_set = 1;
     }
 }

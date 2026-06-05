@@ -1497,6 +1497,42 @@ static const struct wl_registry_listener registry_listener = {
 };
 
 /* -------------------------------------------------------------------------
+ * Cleanup – runs on every exit path that may have allocated buffers.
+ * ---------------------------------------------------------------------- */
+
+static void cleanup_app(App *app)
+{
+    for (int i = 0; i < app->output_count; i++) {
+        Output *out = &app->outputs[i];
+        if (out->viewport) {
+            wp_viewport_destroy(out->viewport);
+        }
+        /* These buffers hold copies of the captured screen (the overlay
+         * buffers have the screenshot blitted into them).  Scrub them before
+         * unmapping so potentially sensitive screen content does not linger
+         * in freed pages until the kernel happens to reuse them.            */
+        for (int bi = 0; bi < 2; bi++) {
+            if (out->ov_pixels[bi]) {
+                explicit_bzero(out->ov_pixels[bi], out->ov_pixels_size);
+                munmap(out->ov_pixels[bi], out->ov_pixels_size);
+            }
+        }
+        if (out->pixels) {
+            explicit_bzero(out->pixels, out->pixels_size);
+            munmap(out->pixels, out->pixels_size);
+        }
+    }
+    if (app->cursor_pixels) {
+        munmap(app->cursor_pixels, app->cursor_pixels_size);
+    }
+    if (app->viewporter) {
+        wp_viewporter_destroy(app->viewporter);
+    }
+
+    wl_display_disconnect(app->display);
+}
+
+/* -------------------------------------------------------------------------
  * main
  * ---------------------------------------------------------------------- */
 
@@ -1579,11 +1615,13 @@ int main(void)
 
     if (app.phase == PHASE_DONE) {
         /* User pressed Escape – clean cancellation. */
+        cleanup_app(&app);
         return 0;
     }
 
     if (app.phase != PHASE_CLIPBOARD) {
         fprintf(stderr, "Capture or pick phase failed\n");
+        cleanup_app(&app);
         return 1;
     }
 
@@ -1597,28 +1635,7 @@ int main(void)
     }
 
     /* ── Cleanup ─────────────────────────────────────────────────────────*/
-    for (int i = 0; i < app.output_count; i++) {
-        Output *out = &app.outputs[i];
-        if (out->viewport) {
-            wp_viewport_destroy(out->viewport);
-        }
-        for (int bi = 0; bi < 2; bi++) {
-            if (out->ov_pixels[bi]) {
-                munmap(out->ov_pixels[bi], out->ov_pixels_size);
-            }
-        }
-        if (out->pixels) {
-            munmap(out->pixels, out->pixels_size);
-        }
-    }
-    if (app.cursor_pixels) {
-        munmap(app.cursor_pixels, app.cursor_pixels_size);
-    }
-    if (app.viewporter) {
-        wp_viewporter_destroy(app.viewporter);
-    }
-
-    wl_display_disconnect(app.display);
+    cleanup_app(&app);
     return 0;
 }
 

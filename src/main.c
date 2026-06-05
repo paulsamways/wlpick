@@ -103,6 +103,14 @@ static void *create_shm_buffer(struct wl_shm *shm,
     size_t stride = (size_t)width * 4U;
     size_t size   = stride * (size_t)height;
 
+    /* wl_shm_create_pool and wl_shm_pool_create_buffer take int32_t sizes;
+     * reject anything that would not survive the cast.  size is the largest
+     * of size/stride/width, so this one check covers all three casts.       */
+    if (size > (size_t)INT32_MAX) {
+        fprintf(stderr, "create_shm_buffer: buffer too large (%zu bytes)\n", size);
+        return NULL;
+    }
+
     int fd = shm_alloc(size);
     if (fd < 0) {
         return NULL;
@@ -143,7 +151,9 @@ typedef struct {
     uint32_t  cap_width;
     uint32_t  cap_height;
     uint32_t  cap_format;           /* SHM pixel format from shm_format event */
-    int       cap_format_set;       /* nonzero once cap_format is confirmed   */
+    int       cap_format_rank;      /* >0 once a usable format is chosen      */
+    size_t    r_off;                /* red byte offset within each 4-byte px  */
+    size_t    b_off;                /* blue byte offset (green is always +1)  */
     uint8_t  *pixels;               /* captured screen pixels (cap_format)    */
     size_t    pixels_size;
     struct wl_buffer *capture_buf;
@@ -436,9 +446,9 @@ static void blit_capture_rect(Output *out, uint32_t *pixels,
     for (int32_t row = y0; row < y1; row++) {
         for (int32_t col = x0; col < x1; col++) {
             size_t  off = (((size_t)row * (size_t)cw) + (size_t)col) * 4U;
-            uint8_t cb  = out->pixels[off + 0U];
+            uint8_t cb  = out->pixels[off + out->b_off];
             uint8_t cg  = out->pixels[off + 1U];
-            uint8_t cr  = out->pixels[off + 2U];
+            uint8_t cr  = out->pixels[off + out->r_off];
             pixels[((size_t)row * (size_t)cw) + (size_t)col] =
                 (0xFFU << 24U) | ((uint32_t)cr << 16U) |
                 ((uint32_t)cg <<  8U) | (uint32_t)cb;
@@ -517,7 +527,10 @@ static void draw_overlay(Output *out)
 
     /* Zoom cursor_px×cursor_px source region to pp×pp in the preview.
      * Source and destination are both in physical pixel coordinates.   */
+    /* zoom must stay >= 1: on a downscaled output (physical < logical) pp can
+     * fall below cursor_px, and zoom is a divisor below — never let it hit 0. */
     int32_t zoom         = pp / cursor_px;
+    if (zoom < 1) { zoom = 1; }
     int32_t src_origin_x = ptr_x - hot_px;
     int32_t src_origin_y = ptr_y - hot_px;
 
@@ -542,9 +555,9 @@ static void draw_overlay(Output *out)
                 color = 0xFF000000U;
             } else {
                 size_t  off = (((size_t)src_py * (size_t)cw) + (size_t)src_px) * 4U;
-                uint8_t cb  = out->pixels[off + 0U];
+                uint8_t cb  = out->pixels[off + out->b_off];
                 uint8_t cg  = out->pixels[off + 1U];
-                uint8_t cr  = out->pixels[off + 2U];
+                uint8_t cr  = out->pixels[off + out->r_off];
                 color = (0xFFU << 24U) | ((uint32_t)cr << 16U) |
                         ((uint32_t)cg << 8U) | (uint32_t)cb;
             }
@@ -649,10 +662,10 @@ static void sample_color(App *app)
     size_t phys_y = ((size_t)py * (size_t)out->cap_height) / (size_t)out->log_height;
 
     size_t offset = ((phys_y * (size_t)out->cap_width) + phys_x) * 4U;
-    uint8_t cb = out->pixels[offset + 0U];
+    uint8_t cb = out->pixels[offset + out->b_off];
     uint8_t cg = out->pixels[offset + 1U];
-    uint8_t cr = out->pixels[offset + 2U];
-    /* byte 3 is alpha – ignored */
+    uint8_t cr = out->pixels[offset + out->r_off];
+    /* remaining byte is alpha/unused – ignored */
 
     app->current_color = ((uint32_t)cr << 16U) |
                           ((uint32_t)cg <<  8U) |
@@ -782,18 +795,22 @@ static const struct ext_image_copy_capture_session_v1_listener
     capture_session_listener;
 
 
+#define BTN_LEFT_EVDEV 0x110U
+
 static void pointer_button(void *data, struct wl_pointer *pointer,
                             uint32_t serial, uint32_t time,
                             uint32_t button, uint32_t state)
 {
-    (void)pointer; (void)time; (void)button;
+    (void)pointer; (void)time;
     App *app = data;
 
     if (app->phase != PHASE_PICK) {
         return;
     }
 
-    if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
+    /* Only the left button copies; ignore every other button. */
+    if (button != BTN_LEFT_EVDEV ||
+        state != WL_POINTER_BUTTON_STATE_PRESSED) {
         return;
     }
 
@@ -1206,23 +1223,39 @@ static void capture_session_buffer_size(void *data,
     out->cap_height = height;
 }
 
+/* Classify an advertised shm format.  We only handle the four 8-bit-per-channel
+ * packed formats whose green byte sits at offset +1 and whose red/blue bytes are
+ * at the two ends; the alpha/unused byte is ignored.  Returns a preference rank
+ * (>0 = usable, higher = preferred) and reports the red/blue byte offsets.   */
+static int shm_format_rank(uint32_t format, size_t *r_off, size_t *b_off)
+{
+    switch (format) {
+    case WL_SHM_FORMAT_ARGB8888: *r_off = 2; *b_off = 0; return 4;
+    case WL_SHM_FORMAT_XRGB8888: *r_off = 2; *b_off = 0; return 3;
+    case WL_SHM_FORMAT_ABGR8888: *r_off = 0; *b_off = 2; return 2;
+    case WL_SHM_FORMAT_XBGR8888: *r_off = 0; *b_off = 2; return 1;
+    default:                                             return 0;
+    }
+}
+
 static void capture_session_shm_format(void *data,
     struct ext_image_copy_capture_session_v1 *session,
     uint32_t format)
 {
     (void)session;
     Output *out = data;
-    /* Only accept formats whose byte order (B=off+0, G=off+1, R=off+2) matches
-     * what blit_capture_rect and sample_color read.  ARGB8888 and XRGB8888
-     * share that layout and differ only in the alpha byte, which we ignore.
-     * Prefer ARGB8888; fall back to XRGB8888 if ARGB8888 is never advertised.
-     * Any other format is silently skipped — the default (ARGB8888) stands.  */
-    if (format == WL_SHM_FORMAT_ARGB8888) {
-        out->cap_format = WL_SHM_FORMAT_ARGB8888;
-        out->cap_format_set = 1;
-    } else if (format == WL_SHM_FORMAT_XRGB8888 && !out->cap_format_set) {
-        out->cap_format = WL_SHM_FORMAT_XRGB8888;
-        out->cap_format_set = 1;
+
+    /* Keep the highest-ranked format the compositor advertises.  Green is read
+     * from offset +1 in every case; r_off/b_off pin down red and blue so the
+     * BGR-order formats (X/ABGR8888) sample the same colours as the RGB ones. */
+    size_t r_off = 0;
+    size_t b_off = 0;
+    int rank = shm_format_rank(format, &r_off, &b_off);
+    if (rank > out->cap_format_rank) {
+        out->cap_format      = format;
+        out->cap_format_rank = rank;
+        out->r_off           = r_off;
+        out->b_off           = b_off;
     }
 }
 
@@ -1253,10 +1286,33 @@ static void capture_session_done(void *data,
         return;
     }
 
-    /* On re-capture the pixel buffer already exists; reuse it.  On the first
-     * capture allocate a new shared-memory buffer and mmap it.            */
+    /* The compositor may re-send buffer constraints — a second `done` — while
+     * a frame is still in flight.  At most one frame may exist per session, so
+     * calling create_frame again would raise the duplicate_frame protocol
+     * error and disconnect us.  We only need a single capture per session, so
+     * ignore constraint updates once a frame is already pending.            */
+    if (out->capture_frame) {
+        return;
+    }
+
+    /* Honour the shm_format constraint: the compositor requires us to attach a
+     * buffer in one of the advertised formats.  If it advertised none we can
+     * read (only ARGB8888/XRGB8888 share our byte order), guessing would mean
+     * attaching an unsupported buffer — fail loudly instead.                 */
+    if (!out->cap_format_rank) {
+        fprintf(stderr, "Capture: no supported shm format advertised\n");
+        app->phase = PHASE_DONE;
+        return;
+    }
+
+    size_t needed = ((size_t)out->cap_width * (size_t)out->cap_height) * 4U;
+
+    /* Allocate the pixel buffer on the first `done`.  If a buffer already
+     * exists from an earlier capture its size must still match the advertised
+     * dimensions, otherwise the compositor would write past the end of our
+     * mapping — bail rather than attach a mismatched buffer.               */
     if (!out->pixels) {
-        out->pixels_size = ((size_t)out->cap_width * (size_t)out->cap_height) * 4U;
+        out->pixels_size = needed;
         out->pixels = create_shm_buffer(app->shm,
                                         out->cap_width, out->cap_height,
                                         out->cap_format,
@@ -1266,6 +1322,10 @@ static void capture_session_done(void *data,
             app->phase = PHASE_DONE;
             return;
         }
+    } else if (out->pixels_size != needed) {
+        fprintf(stderr, "Capture: buffer size changed between sessions\n");
+        app->phase = PHASE_DONE;
+        return;
     }
 
     /* Create the frame, attach listener, and fire the capture – all client-

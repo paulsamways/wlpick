@@ -34,12 +34,11 @@ Requires `meson`, `ninja`, `gcc` or `clang`, `clang-tidy`, `clang-format`, `wayl
 
 ## Architecture
 
-The app progresses through four phases driven by a single `wl_display_dispatch` event loop in `main()`:
+The app progresses through three phases driven by a single `wl_display_dispatch` event loop in `main()`:
 
 1. **PHASE_CAPTURE** — before the overlay appears, capture each connected output once using `ext_image_copy_capture_manager_v1`. Raw ARGB8888 pixels are mmap'd into `Output.pixels`. Captures for all outputs run in parallel; `captures_pending` is decremented per `capture_frame_ready`; when it reaches 0 `start_pick_phase()` is called.
 2. **PHASE_PICK** — a fullscreen transparent `zwlr_layer_surface_v1` overlay is shown on every output. The system cursor is replaced by a custom 10×10 hollow-square surface via `wl_pointer.set_cursor` (hotspot at centre, `CURSOR_HOT=5`). On every `wl_pointer.motion` event the hotspot pixel is read from the captured buffer of the active output and a 100×100 filled preview square is redrawn on that output's overlay. The preview includes a hex label (`#RRGGBB`) in a contrast-aware color (BT.601 luminance, black/white threshold) and a 1-pixel border. Overlay surfaces are **double-buffered** (`ov_buf[2]`, `ov_pixels[2]`, `ov_busy[2]`, `ov_back` index) with a `wl_buffer.release` listener tracking busy state. `wl_display_flush` is called inside `commit_overlay` to eliminate dispatch-cycle latency. Keyboard interactivity is set to `EXCLUSIVE` so Escape is received.
-3. **PHASE_RECAPTURE** — triggered by right-click. All overlay surfaces are committed with blank (transparent) buffers and the cursor is hidden, then fresh capture sessions are started on every output. Because Wayland requests are ordered on the wire, the blank commits arrive at the compositor before the capture frame request. Once all captures complete (`captures_pending` → 0) the cursor is restored and phase returns to PICK. The pixel buffers are **reused** (not reallocated) on recapture.
-4. **PHASE_CLIPBOARD** — on left-click, the hex string is written to a `wl_data_source` and offered via `wl_data_device.set_selection`. All overlay and cursor surfaces are destroyed. The event loop blocks until `wl_data_source.send` (paste) or `wl_data_source.cancelled` (selection replaced) fires, then exits 0.
+3. **PHASE_CLIPBOARD** — on button press, the hex string is written to a `wl_data_source` and offered via `wl_data_device.set_selection`. All overlay and cursor surfaces are destroyed. The event loop blocks until `wl_data_source.send` (paste) or `wl_data_source.cancelled` (selection replaced) fires, then exits 0.
 
 Pressing Escape during PHASE_PICK sets `phase = PHASE_DONE`, which causes the main loop to exit; the app exits 0.
 
@@ -62,7 +61,7 @@ Protocols used:
 
 ```c
 typedef enum {
-    PHASE_CAPTURE, PHASE_PICK, PHASE_RECAPTURE, PHASE_CLIPBOARD, PHASE_DONE
+    PHASE_CAPTURE, PHASE_PICK, PHASE_CLIPBOARD, PHASE_DONE
 } Phase;
 
 typedef struct {
@@ -116,23 +115,21 @@ struct App {
 - `draw_label(out, pixels, sq_x, sq_y, text_color)` — renders hex string at 2× scale (10×14 px per glyph, 2 px gap), centred at bottom of preview square with 4 px bottom margin
 - `draw_border(out, pixels, sq_x, sq_y, border_color)` — 1-pixel border around the preview square
 - `draw_overlay(Output*)` — clears to transparent, draws preview square, computes BT.601 luminance for text color, calls `draw_border` then `draw_label`
-- `commit_blank_overlay(Output*)` — memsetting overlay to transparent and committing; used during recapture to hide the preview before capture
 - `commit_overlay(Output*)` — picks free back buffer, marks busy, flips `ov_back`, attaches/damages/commits, calls `wl_display_flush`
 - `draw_cursor(App*)` — 10×10 hollow white square (1 px border)
 - `sample_color(App*)` — reads from `active_output->pixels`; scales logical→physical: `phys_x = px * cap_width / ov_width`
 - `pointer_enter` — finds active output by surface match; uses entry `sx`/`sy` for immediate preview; calls `sample_color` + `commit_overlay`
 - `pointer_leave` — clears leaving output's overlay with transparent commit + flush; sets `active_output = NULL`; guards `surface &&` to avoid NULL crash from libwayland
 - `pointer_motion` — guards `phase == PICK && active_output`; calls `sample_color` + `commit_overlay`
-- `start_recapture(App*)` — commits blank to all overlays, hides cursor, sets `PHASE_RECAPTURE`, starts fresh capture sessions on all outputs, flushes
-- `pointer_button` — right-click → `start_recapture`; left-click → destroy overlays/cursor, create data_source, set clipboard selection, set `PHASE_CLIPBOARD`; uses button-press `serial` (not stale enter serial)
+- `pointer_button` — on press → destroy overlays/cursor, create data_source, set clipboard selection, set `PHASE_CLIPBOARD`; uses button-press `serial` (not stale enter serial)
 - `keyboard_key` — Escape (evdev keycode 1) → `phase = PHASE_DONE`
 - `layer_surface_configure` — allocates 2 overlay buffers + adds `ov_buffer_listener`; commits a blank frame (not `draw_overlay`) to avoid ghost preview at (0,0); increments `overlays_configured`; sets `phase = PICK` when all outputs configured
-- `capture_frame_ready` — destroys frame/session/source; decrements `captures_pending`; on RECAPTURE: restores cursor + redraws overlay; on initial CAPTURE: calls `start_pick_phase`
-- `capture_session_done` — allocates pixel buffer if not already allocated (reuses on recapture), creates frame, attaches + damages + fires capture in one step
+- `capture_frame_ready` — destroys frame/session/source; decrements `captures_pending`; when it reaches 0 calls `start_pick_phase`
+- `capture_session_done` — allocates pixel buffer if not already allocated, creates frame, attaches + damages + fires capture in one step
 - `data_source_send` — writes `color_str` to fd; closes fd; sets `phase = DONE`
 - `data_source_cancelled` — destroys source; sets `phase = DONE`
 - `registry_global` — binds all globals; binds every `wl_output` (no single-output guard)
-- `main` — 3 roundtrips; validates globals; creates data_device; starts captures; runs merged CAPTURE+PICK+RECAPTURE event loop; checks `PHASE_DONE` (Escape → exit 0) before `PHASE_CLIPBOARD` check; runs clipboard loop; cleanup (munmap all buffers)
+- `main` — 3 roundtrips; validates globals; creates data_device; starts captures; runs merged CAPTURE+PICK event loop; checks `PHASE_DONE` (Escape → exit 0) before `PHASE_CLIPBOARD` check; runs clipboard loop; cleanup (munmap all buffers)
 
 ## Known patterns and pitfalls
 
@@ -144,6 +141,6 @@ struct App {
 - `layer_surface_configure` must commit a **blank** frame on first configure — calling `draw_overlay` with zero pointer coordinates causes a ghost preview square at (0,0) on all outputs
 - `pointer_leave` receives `surface == NULL` from libwayland when the proxy is already destroyed — must guard with `surface &&` before comparing
 - Button serial for `wl_data_device_set_selection` must come from the `pointer_button` event, not from the stale `pointer_enter` serial
-- `capture_session_done` must **not** reallocate the pixel buffer on recapture (same output, same dimensions); check `!out->pixels` first
+- `capture_session_done` guards pixel-buffer allocation with `!out->pixels` so a re-sent `done` (the compositor may emit buffer constraints more than once) does not allocate a second buffer
 - Cognitive complexity limit is 25 per function (clang-tidy `readability-function-cognitive-complexity`); extract helpers rather than adding more nesting
 

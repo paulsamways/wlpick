@@ -7,10 +7,9 @@ A minimal, dependency-free color picker for wlroots-based Wayland compositors (S
 Launch the app and your cursor is replaced with a 10×10 hollow-square cursor. A 100×100 pixel preview square appears next to the cursor showing the color under the hotspot, updated live as you move the mouse. The hex code (`#RRGGBB`) is rendered inside the preview square in a contrast-aware color (black on light backgrounds, white on dark), with a matching 1-pixel border around the square.
 
 - **Left-click** anywhere to copy the color to the clipboard and exit.
-- **Right-click** to re-capture the screen and refresh the sampled image (useful when the initial capture missed hardware-accelerated content).
 - **Escape** to cancel and exit with a success code.
 
-The selected color is placed on the clipboard in `#RRGGBB` format. The process stays alive briefly to serve paste requests (standard Wayland clipboard behavior), then exits once another copy operation replaces the selection.
+The selected color is placed on the clipboard in `#RRGGBB` format. The process stays alive just long enough to serve the clipboard once — it exits as soon as another client reads the selection (a paste), or earlier if another copy operation replaces it.
 
 ## Compatibility
 
@@ -27,7 +26,7 @@ The binding constraint is `ext_image_copy_capture_v1` and `ext_image_capture_sou
 
 Multi-monitor setups are fully supported — up to 8 outputs are tracked simultaneously, each with its own screen capture and overlay surface.
 
-> **Note on hardware-accelerated content:** The screen is captured once at startup using the compositor's framebuffer. Content rendered via direct KMS/DRM scanout (fullscreen games, hardware-decoded video) may not be captured accurately — this is a compositor-level limitation, not a bug in the app. Right-click to trigger a fresh capture if you need to sample a region that was not captured correctly.
+> **Note on hardware-accelerated content:** The screen is captured once at startup using the compositor's framebuffer. Content rendered via direct KMS/DRM scanout (fullscreen games, hardware-decoded video) may not be captured accurately — this is a compositor-level limitation, not a bug in the app.
 
 ## How it works
 
@@ -49,15 +48,9 @@ On every pointer motion event:
 
 On left-click: transitions to the clipboard phase (see below).
 
-On right-click: transitions to the recapture phase (see below).
-
 On Escape: exits with code 0.
 
-### 3. Recapture phase
-
-Triggered by right-click when the initial capture may not have included hardware-accelerated content. All overlay surfaces are blanked and the cursor is hidden, then a fresh capture session is started on every output. Because Wayland requests are processed in wire order, the compositor applies the blank commits before rendering the captured frame, ensuring the preview square does not appear in the new screenshot. Once all captures complete, the cursor and overlay are restored and the app returns to the pick phase.
-
-### 4. Clipboard phase
+### 3. Clipboard phase
 
 On left-click, the color string is offered via `wl_data_source` / `wl_data_device`. The overlay and cursor surfaces are destroyed immediately. The event loop then blocks until another app pastes (triggering `wl_data_source.send`) or replaces the selection (`wl_data_source.cancelled`), at which point the process exits cleanly.
 

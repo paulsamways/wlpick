@@ -7,7 +7,7 @@ This file provides guidance to agents when working with code in this repository.
 ```sh
 meson setup build
 meson compile -C build
-./build/wayland-color-picker
+./build/wlpick
 ```
 
 Lint:

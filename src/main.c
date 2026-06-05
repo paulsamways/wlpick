@@ -1,4 +1,4 @@
-/* wayland-color-picker – minimal Wayland color picker.
+/* wlpick – minimal Wayland color picker.
  *
  * Three-phase flow:
  *   capture   – capture all connected outputs once before the overlay exists.
@@ -67,7 +67,7 @@ static int shm_alloc(size_t size)
     int fd = -1;
 
 #ifdef __linux__
-    fd = memfd_create("wayland-color-picker-shm", MFD_CLOEXEC);
+    fd = memfd_create("wlpick-shm", MFD_CLOEXEC);
 #endif
     if (fd < 0) {
         /* Fall back to shm_open + unlink on other POSIX systems. */
@@ -1122,7 +1122,7 @@ static void start_pick_phase(App *app)
             out->overlay_surface,
             out->wl_output,
             ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
-            "color-picker");
+            "wlpick");
 
         zwlr_layer_surface_v1_set_size(out->layer_surface, 0, 0);
         zwlr_layer_surface_v1_set_anchor(out->layer_surface, all_anchors);

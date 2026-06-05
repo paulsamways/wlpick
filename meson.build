@@ -1,4 +1,4 @@
-project('wayland-color-picker', 'c',
+project('wlpick', 'c',
   version : '0.1.0',
   default_options : [
     'c_std=c11',
@@ -51,7 +51,7 @@ foreach proto : protocols
   protocol_sources += source
 endforeach
 
-executable('wayland-color-picker',
+executable('wlpick',
   sources : ['src/main.c', 'src/stubs.c'] + protocol_sources + protocol_headers,
   dependencies : [wayland_client],
   c_args : extra_args,

@@ -1,4 +1,4 @@
-# wayland-color-picker
+# wlpick
 
 A minimal, dependency-free color picker for wlroots-based Wayland compositors (Sway, Hyprland, and others). It captures the screen, lets you hover over any pixel to preview its color in real time, and copies the hex code to your clipboard on click — all without pulling in any GUI toolkit or image processing library. The only runtime dependency is `libwayland-client`.
 
@@ -120,12 +120,12 @@ meson setup build
 meson compile -C build
 ```
 
-The compiled binary is at `./build/wayland-color-picker`.
+The compiled binary is at `./build/wlpick`.
 
 ### Running
 
 ```sh
-./build/wayland-color-picker
+./build/wlpick
 ```
 
 ### Linting

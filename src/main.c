@@ -1453,14 +1453,27 @@ static const struct wl_data_source_listener data_source_listener = {
  * Registry listener
  * ---------------------------------------------------------------------- */
 
+/* Bind no higher than the advertised version: requesting a version the
+ * compositor does not support is a protocol error and disconnects us.   */
+static uint32_t bind_version(uint32_t advertised, uint32_t wanted)
+{
+    return (advertised < wanted) ? advertised : wanted;
+}
+
 static void registry_global(void *data, struct wl_registry *registry,
                               uint32_t name, const char *interface,
                               uint32_t version)
 {
-    (void)version;
     App *app = data;
 
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
+        /* wl_surface.damage_buffer requires version 4 — a hard minimum. */
+        if (version < 4U) {
+            fprintf(stderr,
+                    "wl_compositor version 4 required (compositor has %u)\n",
+                    version);
+            return;
+        }
         app->compositor = wl_registry_bind(registry, name,
                                             &wl_compositor_interface, 4);
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
@@ -1470,14 +1483,17 @@ static void registry_global(void *data, struct wl_registry *registry,
             Output *out = &app->outputs[app->output_count++];
             out->app = app;
             out->wl_output = wl_registry_bind(registry, name,
-                                               &wl_output_interface, 3);
+                                               &wl_output_interface,
+                                               bind_version(version, 3U));
         }
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-        app->seat = wl_registry_bind(registry, name, &wl_seat_interface, 5);
+        app->seat = wl_registry_bind(registry, name, &wl_seat_interface,
+                                     bind_version(version, 5U));
         wl_seat_add_listener(app->seat, &seat_listener, app);
     } else if (strcmp(interface, wl_data_device_manager_interface.name) == 0) {
         app->ddm = wl_registry_bind(registry, name,
-                                     &wl_data_device_manager_interface, 3);
+                                     &wl_data_device_manager_interface,
+                                     bind_version(version, 3U));
     } else if (strcmp(interface,
                       ext_output_image_capture_source_manager_v1_interface.name)
                == 0) {
@@ -1491,7 +1507,8 @@ static void registry_global(void *data, struct wl_registry *registry,
             &ext_image_copy_capture_manager_v1_interface, 1);
     } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         app->layer_shell = wl_registry_bind(registry, name,
-                                             &zwlr_layer_shell_v1_interface, 4);
+                                             &zwlr_layer_shell_v1_interface,
+                                             bind_version(version, 4U));
     } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
         app->viewporter = wl_registry_bind(registry, name,
                                             &wp_viewporter_interface, 1);

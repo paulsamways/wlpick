@@ -1182,6 +1182,19 @@ static void capture_frame_ready(void *data,
     ext_image_capture_source_v1_destroy(out->capture_source);
     out->capture_source = NULL;
 
+    /* The compositor may have sent a new buffer_size (e.g. on an output mode
+     * change) while the frame was in flight, updating cap_width/cap_height
+     * after out->pixels was allocated.  Everything downstream indexes
+     * out->pixels by cap_width × cap_height, so a mismatch would read past
+     * the end of the mapping.  The session is destroyed above, so no further
+     * buffer_size events can arrive — this check closes the race for good. */
+    size_t expected = ((size_t)out->cap_width * (size_t)out->cap_height) * 4U;
+    if (expected != out->pixels_size) {
+        fprintf(stderr, "Capture: buffer size changed while frame was in flight\n");
+        app->phase = PHASE_DONE;
+        return;
+    }
+
     app->captures_pending--;
 
     if (app->captures_pending == 0) {

@@ -236,6 +236,41 @@ struct App {
 };
 
 /* -------------------------------------------------------------------------
+ * Screen-buffer scrubbing
+ * ---------------------------------------------------------------------- */
+
+/* Scrub and release every buffer that holds captured screen content: the
+ * capture buffer and both overlay buffers of each output.  Zeroing before
+ * munmap ensures potentially sensitive pixels do not linger in freed pages
+ * (or swap / core dumps) until the kernel happens to reuse them.          */
+static void release_screen_buffers(App *app)
+{
+    for (int i = 0; i < app->output_count; i++) {
+        Output *out = &app->outputs[i];
+        for (int bi = 0; bi < 2; bi++) {
+            if (out->ov_pixels[bi]) {
+                explicit_bzero(out->ov_pixels[bi], out->ov_pixels_size);
+                munmap(out->ov_pixels[bi], out->ov_pixels_size);
+                out->ov_pixels[bi] = NULL;
+            }
+            if (out->ov_buf[bi]) {
+                wl_buffer_destroy(out->ov_buf[bi]);
+                out->ov_buf[bi] = NULL;
+            }
+        }
+        if (out->pixels) {
+            explicit_bzero(out->pixels, out->pixels_size);
+            munmap(out->pixels, out->pixels_size);
+            out->pixels = NULL;
+        }
+        if (out->capture_buf) {
+            wl_buffer_destroy(out->capture_buf);
+            out->capture_buf = NULL;
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
  * Drawing helpers
  * ---------------------------------------------------------------------- */
 
@@ -831,6 +866,11 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
             out->overlay_surface = NULL;
         }
     }
+
+    /* The picked color is already in color_str; the screenshots are no
+     * longer needed.  Scrub and unmap them now rather than at exit so screen
+     * content does not sit in memory for the unbounded clipboard wait.     */
+    release_screen_buffers(app);
 
     /* Set clipboard selection. */
     app->data_source = wl_data_device_manager_create_data_source(app->ddm);
@@ -1537,21 +1577,8 @@ static void cleanup_app(App *app)
         if (out->viewport) {
             wp_viewport_destroy(out->viewport);
         }
-        /* These buffers hold copies of the captured screen (the overlay
-         * buffers have the screenshot blitted into them).  Scrub them before
-         * unmapping so potentially sensitive screen content does not linger
-         * in freed pages until the kernel happens to reuse them.            */
-        for (int bi = 0; bi < 2; bi++) {
-            if (out->ov_pixels[bi]) {
-                explicit_bzero(out->ov_pixels[bi], out->ov_pixels_size);
-                munmap(out->ov_pixels[bi], out->ov_pixels_size);
-            }
-        }
-        if (out->pixels) {
-            explicit_bzero(out->pixels, out->pixels_size);
-            munmap(out->pixels, out->pixels_size);
-        }
     }
+    release_screen_buffers(app);
     if (app->cursor_pixels) {
         munmap(app->cursor_pixels, app->cursor_pixels_size);
     }
